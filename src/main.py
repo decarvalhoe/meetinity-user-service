@@ -1,17 +1,30 @@
+import os
+
 from flask import Flask, jsonify
 
-app = Flask(__name__)
+from src.auth.oauth import init_oauth
+from src.routes.auth import auth_bp
 
 
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok", "service": "user-service"})
+def create_app() -> Flask:
+    app = Flask(__name__)
+    app.secret_key = os.getenv("FLASK_SECRET", "dev")
+    init_oauth(app)
+
+    @app.route("/health")
+    def health():
+        return jsonify({"status": "ok", "service": "user-service"})
+
+    @app.route("/users")
+    def users():
+        return jsonify({"users": []})
+
+    app.register_blueprint(auth_bp)
+    return app
 
 
-@app.route('/users')
-def users():
-    return jsonify({"users": []})
+app = create_app()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True, port=5001)
