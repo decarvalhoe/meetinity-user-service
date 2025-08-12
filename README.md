@@ -12,8 +12,14 @@ Provides CRUD operations for user profiles with search and photo upload.
 - `GET /users/search` search users
 
 ## Development
-```
+### Run & Test (dev)
+```powershell
 pip install -r requirements.txt
 flake8 src tests
 pytest
+Copy-Item .env.example .env
+$env:APP_PORT=5001
+$env:CORS_ORIGINS="http://localhost:5173,http://localhost:5174"
+$env:JWT_SECRET="dev-secret"
+python src/main.py
 ```

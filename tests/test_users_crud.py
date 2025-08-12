@@ -12,6 +12,7 @@ def test_user_crud(client):
     )
     assert res.status_code == 201
     user_id = res.json['user']['id']
+    assert res.json['user']['created_at'].endswith('+00:00')
 
     # retrieve
     res = client.get(f'/users/{user_id}')

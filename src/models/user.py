@@ -1,4 +1,5 @@
-from sqlalchemy import func, Index
+from datetime import datetime, timezone
+from sqlalchemy import Index
 from . import db
 
 
@@ -18,12 +19,18 @@ class User(db.Model):
     industry = db.Column(db.String(120))
     linkedin_url = db.Column(db.String(255))
     photo_url = db.Column(db.String(255))
-    created_at = db.Column(db.DateTime, default=func.now(), index=True)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        index=True,
+    )
     updated_at = db.Column(
-        db.DateTime, default=func.now(), onupdate=func.now()
+        db.DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
     is_active = db.Column(db.Boolean, default=True)
-    last_login = db.Column(db.DateTime, nullable=True)
+    last_login = db.Column(db.DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         Index('idx_users_industry_location', 'industry', 'location'),

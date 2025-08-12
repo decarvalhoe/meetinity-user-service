@@ -1,3 +1,4 @@
+from datetime import timezone
 from marshmallow import (
     Schema,
     fields,
@@ -59,6 +60,10 @@ class UserUpdateSchema(UserBaseSchema):
 def user_to_dict(user: User):
     schema = UserSchema()
     data = schema.dump(user)
+    for field in ['created_at', 'updated_at', 'last_login']:
+        dt = getattr(user, field)
+        if dt is not None and dt.tzinfo is None:
+            data[field] = dt.replace(tzinfo=timezone.utc).isoformat()
     for key in ['skills', 'interests']:
         data[key] = getattr(user, key + '_list')()
     return data
