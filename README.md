@@ -2,11 +2,17 @@
 
 Flask-based user service with OAuth authentication via Google and LinkedIn.
 
-## Setup
+## Configuration
+
+- `CORS_ORIGINS`: comma-separated list of allowed origins for CORS. Defaults to `*`.
+- All timestamps are returned in ISO 8601 format with UTC timezone.
+
+## Development
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env  # then fill values
+flake8 src tests
+pytest
 ```
 
 ## Running
@@ -22,10 +28,3 @@ python src/main.py
 - `POST /auth/verify` → `{ "valid": true, "sub": "<user_id>", "exp": 123 }`
 - `GET /auth/profile` (Bearer token) → `{ "user": {...} }`
 - `GET /health`
-
-## Testing
-
-```bash
-flake8 src tests
-pytest
-```
