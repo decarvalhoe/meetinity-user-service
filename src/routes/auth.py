@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request, session
 
@@ -82,7 +82,7 @@ def auth_callback(provider: str):
         photo_url=info.get("picture") or info.get("profilePicture"),
         provider=provider,
         provider_user_id=info.get("sub") or info.get("id"),
-        last_login=datetime.utcnow(),
+        last_login=datetime.now(timezone.utc),
     )
     token = encode_jwt(user)
     return jsonify(

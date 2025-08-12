@@ -9,6 +9,12 @@ pip install -r requirements.txt
 cp .env.example .env  # then fill values
 ```
 
+## Running
+
+```bash
+python src/main.py
+```
+
 ## Endpoints
 
 - `POST /auth/<provider>` → `{ "auth_url": "https://..." }`
@@ -21,5 +27,5 @@ cp .env.example .env  # then fill values
 
 ```bash
 flake8 src tests
-pytest --cov=src
+pytest
 ```

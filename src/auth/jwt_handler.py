@@ -1,5 +1,5 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import jwt
@@ -11,7 +11,7 @@ JWT_TTL_MIN = int(os.getenv("JWT_TTL_MIN", "60"))
 
 
 def encode_jwt(user) -> str:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": user.id,
         "email": user.email,
