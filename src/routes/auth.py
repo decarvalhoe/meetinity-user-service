@@ -1,3 +1,9 @@
+# -*- coding: utf-8 -*-
+"""Authentication routes for the User Service.
+
+This file defines the routes for OAuth authentication, token verification, and user profile retrieval.
+"""
+
 import os
 from datetime import datetime, timezone
 
@@ -20,6 +26,16 @@ ALLOWED_REDIRECTS = set(
 
 
 def _error(code: int, message: str, details: dict | None = None):
+    """Create a standardized error response.
+
+    Args:
+        code (int): The HTTP status code.
+        message (str): The error message.
+        details (dict, optional): Additional error details. Defaults to None.
+
+    Returns:
+        Response: A JSON response with the error details.
+    """
     return (
         jsonify(
             {
@@ -36,6 +52,14 @@ def _error(code: int, message: str, details: dict | None = None):
 
 @auth_bp.post("/<provider>")
 def auth_start(provider: str):
+    """Start the OAuth authentication process.
+
+    Args:
+        provider (str): The OAuth provider (e.g., 'google', 'linkedin').
+
+    Returns:
+        Response: A JSON response with the authentication URL.
+    """
     if provider not in {"google", "linkedin"}:
         return _error(400, "bad provider")
     data = request.get_json(silent=True) or {}
@@ -59,6 +83,14 @@ def auth_start(provider: str):
 
 @auth_bp.get("/<provider>/callback")
 def auth_callback(provider: str):
+    """Handle the OAuth callback.
+
+    Args:
+        provider (str): The OAuth provider.
+
+    Returns:
+        Response: A JSON response with the JWT and user information.
+    """
     if provider not in {"google", "linkedin"}:
         return _error(400, "bad provider")
     code = request.args.get("code")
@@ -95,6 +127,11 @@ def auth_callback(provider: str):
 
 @auth_bp.post("/verify")
 def verify():
+    """Verify a JWT.
+
+    Returns:
+        Response: A JSON response with the verification status.
+    """
     data = request.get_json() or {}
     token = data.get("token")
     if not token:
@@ -111,6 +148,11 @@ def verify():
 @auth_bp.get("/profile")
 @require_auth
 def profile():
+    """Get the user profile.
+
+    Returns:
+        Response: A JSON response with the user's profile information.
+    """
     user_id = request.user["sub"]
     user = get_user(user_id)
     if not user:
@@ -118,3 +160,4 @@ def profile():
     return jsonify(
         {"user": {"id": user.id, "email": user.email, "name": user.name}}
     )
+

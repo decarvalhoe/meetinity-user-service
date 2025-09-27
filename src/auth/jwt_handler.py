@@ -1,3 +1,9 @@
+"""JWT handler for the User Service.
+
+This file provides functions for encoding and decoding JSON Web Tokens (JWTs)
+and a decorator for requiring JWT authentication on routes.
+"""
+
 import os
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -11,6 +17,14 @@ JWT_TTL_MIN = int(os.getenv("JWT_TTL_MIN", "60"))
 
 
 def encode_jwt(user) -> str:
+    """Encode a JWT for a given user.
+
+    Args:
+        user: The user object.
+
+    Returns:
+        str: The encoded JWT.
+    """
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user.id,
@@ -23,10 +37,26 @@ def encode_jwt(user) -> str:
 
 
 def decode_jwt(token: str):
+    """Decode a JWT.
+
+    Args:
+        token (str): The JWT to decode.
+
+    Returns:
+        dict: The decoded JWT payload.
+    """
     return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
 
 
 def require_auth(fn):
+    """Decorator to require JWT authentication for a route.
+
+    Args:
+        fn: The function to wrap.
+
+    Returns:
+        function: The wrapped function.
+    """
     @wraps(fn)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
@@ -44,3 +74,4 @@ def require_auth(fn):
         return fn(*args, **kwargs)
 
     return wrapper
+

@@ -1,3 +1,10 @@
+# -*- coding: utf-8 -*-
+"""Main application file for the User Service.
+
+This file initializes the Flask application, configures CORS, sets up error handlers,
+and registers the authentication blueprint.
+"""
+
 import os
 from datetime import datetime, timezone
 
@@ -10,6 +17,11 @@ from src.routes.auth import auth_bp
 
 
 def create_app() -> Flask:
+    """Create and configure the Flask application.
+
+    Returns:
+        Flask: The configured Flask application.
+    """
     app = Flask(__name__)
     app.secret_key = os.getenv("FLASK_SECRET", "dev")
 
@@ -19,18 +31,39 @@ def create_app() -> Flask:
 
     @app.errorhandler(HTTPException)
     def handle_http_exception(err: HTTPException):
+        """Handle HTTP exceptions.
+
+        Args:
+            err (HTTPException): The HTTP exception.
+
+        Returns:
+            Response: A JSON response with the error description and status code.
+        """
         response = jsonify({"error": err.description})
         response.status_code = err.code
         return response
 
     @app.errorhandler(Exception)
     def handle_exception(err: Exception):
+        """Handle non-HTTP exceptions.
+
+        Args:
+            err (Exception): The exception.
+
+        Returns:
+            Response: A JSON response with the error message and a 500 status code.
+        """
         response = jsonify({"error": str(err)})
         response.status_code = 500
         return response
 
     @app.route("/health")
     def health():
+        """Health check endpoint.
+
+        Returns:
+            Response: A JSON response with the service status and timestamp.
+        """
         return jsonify(
             {
                 "status": "ok",
@@ -41,6 +74,11 @@ def create_app() -> Flask:
 
     @app.route("/users")
     def users():
+        """Get a list of users (placeholder).
+
+        Returns:
+            Response: A JSON response with an empty list of users.
+        """
         return jsonify({"users": []})
 
     app.register_blueprint(auth_bp)
@@ -53,3 +91,4 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5001"))
     app.run(debug=True, port=port)
+
