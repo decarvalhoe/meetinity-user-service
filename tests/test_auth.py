@@ -3,6 +3,40 @@ from importlib import reload
 
 import pytest
 
+
+class DummyResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if not 200 <= self.status_code < 300:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class DummyLinkedInClient:
+    def __init__(self, profile_payload, email_payload):
+        self.profile_payload = profile_payload
+        self.email_payload = email_payload
+        self.fetch_token_calls = []
+        self.get_calls = []
+
+    def fetch_token(self, code, redirect_uri):
+        self.fetch_token_calls.append((code, redirect_uri))
+        return {"access_token": "dummy-token"}
+
+    def get(self, endpoint, token=None, params=None):
+        self.get_calls.append((endpoint, token, params))
+        if endpoint == "me":
+            return DummyResponse(self.profile_payload)
+        if endpoint == "emailAddress":
+            return DummyResponse(self.email_payload)
+        raise AssertionError(f"Unexpected endpoint {endpoint}")
+
+
 os.environ.setdefault("JWT_SECRET", "testsecret")
 os.environ.setdefault(
     "GOOGLE_REDIRECT_URI", "http://localhost/auth/google/callback"
@@ -40,13 +74,6 @@ def mock_fetch_user_info(provider, code, redirect_uri, nonce=None):
             "sub": "abc",
             "picture": "http://pic",
         }
-    if provider == "linkedin":
-        return {
-            "email": "ln@example.com",
-            "localizedFirstName": "Ln",
-            "id": "ln123",
-            "profilePicture": "http://pic-ln",
-        }
     return {}
 
 
@@ -78,19 +105,54 @@ def test_google_flow(client, monkeypatch):
 
 def test_linkedin_flow(client, monkeypatch):
     monkeypatch.setattr("src.routes.auth.build_auth_url", mock_build_auth_url)
+
+    profile_payload = {
+        "id": "ln123",
+        "localizedFirstName": "Ln",
+        "localizedLastName": "User",
+        "profilePicture": {
+            "displayImage~": {
+                "elements": [
+                    {"identifiers": [{"identifier": "http://pic-ln"}]}
+                ]
+            }
+        },
+    }
+    email_payload = {
+        "elements": [
+            {"handle~": {"emailAddress": "ln@example.com"}},
+        ]
+    }
+    dummy_client = DummyLinkedInClient(profile_payload, email_payload)
+
+    def fake_create_client(name):
+        assert name == "linkedin"
+        return dummy_client
+
     monkeypatch.setattr(
-        "src.routes.auth.fetch_user_info", mock_fetch_user_info
+        "src.auth.oauth.oauth.create_client",
+        fake_create_client,
     )
 
     resp = client.post("/auth/linkedin")
     assert resp.status_code == 200
     with client.session_transaction() as sess:
         state = sess["state"]
-    resp = client.get(
-        f"/auth/linkedin/callback?code=code&state={state}"
-    )
+    callback_url = f"/auth/linkedin/callback?code=code&state={state}"
+    resp = client.get(callback_url)
     assert resp.status_code == 200
     assert resp.json["user"]["email"] == "ln@example.com"
+    assert resp.json["user"]["name"] == "Ln User"
+
+    user = get_user_by_email("ln@example.com")
+    assert user.provider_user_id == "ln123"
+    assert user.photo_url == "http://pic-ln"
+
+    assert dummy_client.fetch_token_calls == [
+        ("code", os.getenv("LINKEDIN_REDIRECT_URI"))
+    ]
+    endpoints = [call[0] for call in dummy_client.get_calls]
+    assert endpoints == ["me", "emailAddress"]
 
 
 def test_google_flow_with_custom_redirect(client, monkeypatch):

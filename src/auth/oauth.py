@@ -25,6 +25,7 @@ def init_oauth(app):
         authorize_url="https://www.linkedin.com/oauth/v2/authorization",
         client_kwargs={"scope": "r_liteprofile r_emailaddress"},
         api_base_url="https://api.linkedin.com/v2",
+        userinfo_endpoint="https://api.linkedin.com/v2/me",
     )
 
 
@@ -62,6 +63,59 @@ def fetch_user_info(  # pragma: no cover
     if provider == "google":
         return client.parse_id_token(token, nonce=nonce)
     if provider == "linkedin":
-        resp = client.get("userinfo", token=token)
-        return resp.json()
+        projection = (
+            "(id,localizedFirstName,localizedLastName," "profilePicture("
+            "displayImage~:playableStreams))"
+        )
+        profile_resp = client.get(
+            "me",
+            token=token,
+            params={"projection": projection},
+        )
+        profile_resp.raise_for_status()
+        profile_data = profile_resp.json()
+
+        email_resp = client.get(
+            "emailAddress",
+            token=token,
+            params={
+                "q": "members",
+                "projection": "(elements*(handle~))",
+            },
+        )
+        email_resp.raise_for_status()
+        email_data = email_resp.json()
+
+        email = None
+        for element in email_data.get("elements", []):
+            handle = element.get("handle~", {})
+            email = handle.get("emailAddress")
+            if email:
+                break
+
+        picture = None
+        picture_info = (
+            profile_data.get("profilePicture", {})
+            .get("displayImage~", {})
+            .get("elements", [])
+        )
+        for element in picture_info:
+            identifiers = element.get("identifiers", [])
+            if identifiers:
+                picture = identifiers[0].get("identifier")
+            if picture:
+                break
+
+        first_name = profile_data.get("localizedFirstName")
+        last_name = profile_data.get("localizedLastName")
+        full_name = " ".join(filter(None, [first_name, last_name])) or None
+
+        return {
+            "email": email,
+            "localizedFirstName": first_name,
+            "localizedLastName": last_name,
+            "name": full_name,
+            "id": profile_data.get("id"),
+            "profilePicture": picture,
+        }
     raise ValueError("unsupported provider")
