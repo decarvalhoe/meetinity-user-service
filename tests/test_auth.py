@@ -1,4 +1,6 @@
 import os
+from importlib import reload
+
 import pytest
 
 os.environ.setdefault("JWT_SECRET", "testsecret")
@@ -105,6 +107,39 @@ def test_invalid_redirect(client):
         json={"redirect_uri": "http://evil.com/callback"},
     )
     assert resp.status_code == 400
+
+
+def test_allowed_redirects_with_spaces(monkeypatch):
+    monkeypatch.setenv(
+        "ALLOWED_REDIRECTS",
+        " https://allowed.example/callback ,"
+        "  https://second.example/return  ",
+    )
+    import src.routes.auth as auth_module
+
+    reload(auth_module)
+
+    def _stub_build_auth_url(provider, redirect_uri, state, nonce=None):
+        return "https://auth.example"
+
+    monkeypatch.setattr(
+        auth_module,
+        "build_auth_url",
+        _stub_build_auth_url,
+    )
+
+    import src.main as main_module
+
+    reload(main_module)
+    test_app = main_module.create_app()
+
+    with test_app.test_client() as client:
+        response = client.post(
+            "/auth/google",
+            json={"redirect_uri": "https://allowed.example/callback"},
+        )
+
+    assert response.status_code == 200
 
 
 def test_verify_invalid_token(client):

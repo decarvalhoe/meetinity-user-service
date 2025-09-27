@@ -20,9 +20,11 @@ from src.models.user import get_user, upsert_user
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
-ALLOWED_REDIRECTS = set(
-    filter(None, os.getenv("ALLOWED_REDIRECTS", "").split(","))
-)
+ALLOWED_REDIRECTS = {
+    value.strip()
+    for value in os.getenv("ALLOWED_REDIRECTS", "").split(",")
+    if value.strip()
+}
 
 
 def _error(code: int, message: str, details: dict | None = None):
