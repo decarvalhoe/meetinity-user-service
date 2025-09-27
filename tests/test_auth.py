@@ -91,6 +91,39 @@ def test_linkedin_flow(client, monkeypatch):
     assert resp.json["user"]["email"] == "ln@example.com"
 
 
+def test_google_flow_with_custom_redirect(client, monkeypatch):
+    custom_redirect = "http://localhost/custom"
+    captured = {}
+
+    monkeypatch.setattr("src.routes.auth.build_auth_url", mock_build_auth_url)
+
+    def capturing_fetch(provider, code, redirect_uri, nonce=None):
+        captured["redirect_uri"] = redirect_uri
+        return mock_fetch_user_info(provider, code, redirect_uri, nonce)
+
+    monkeypatch.setattr("src.routes.auth.fetch_user_info", capturing_fetch)
+    monkeypatch.setattr(
+        "src.routes.auth.ALLOWED_REDIRECTS", {custom_redirect}
+    )
+
+    resp = client.post(
+        "/auth/google", json={"redirect_uri": custom_redirect}
+    )
+    assert resp.status_code == 200
+    with client.session_transaction() as sess:
+        state = sess["state"]
+        assert sess["redirect_uri"] == custom_redirect
+
+    resp = client.get(f"/auth/google/callback?code=abc&state={state}")
+    assert resp.status_code == 200
+    assert captured["redirect_uri"] == custom_redirect
+
+    with client.session_transaction() as sess:
+        assert "state" not in sess
+        assert "nonce" not in sess
+        assert "redirect_uri" not in sess
+
+
 def test_invalid_state(client, monkeypatch):
     monkeypatch.setattr("src.routes.auth.build_auth_url", mock_build_auth_url)
     resp = client.post("/auth/google")

@@ -63,15 +63,18 @@ def auth_start(provider: str):
     if provider not in {"google", "linkedin"}:
         return _error(400, "bad provider")
     data = request.get_json(silent=True) or {}
-    redirect_uri = data.get("redirect_uri") or os.getenv(
-        f"{provider.upper()}_REDIRECT_URI"
-    )
-    if (
-        redirect_uri
-        and redirect_uri not in ALLOWED_REDIRECTS
-        and redirect_uri != os.getenv(f"{provider.upper()}_REDIRECT_URI")
-    ):
-        return _error(400, "invalid redirect")
+    default_redirect_uri = os.getenv(f"{provider.upper()}_REDIRECT_URI")
+    requested_redirect = data.get("redirect_uri")
+    redirect_uri = requested_redirect or default_redirect_uri
+    if requested_redirect:
+        if (
+            requested_redirect not in ALLOWED_REDIRECTS
+            and requested_redirect != default_redirect_uri
+        ):
+            return _error(400, "invalid redirect")
+        session["redirect_uri"] = requested_redirect
+    else:
+        session.pop("redirect_uri", None)
     state = generate_state()
     session["state"] = state
     nonce = generate_nonce() if provider == "google" else None
@@ -93,36 +96,43 @@ def auth_callback(provider: str):
     """
     if provider not in {"google", "linkedin"}:
         return _error(400, "bad provider")
-    code = request.args.get("code")
-    state = request.args.get("state")
-    if not code or not state:
-        return _error(400, "missing code or state")
-    if state != session.get("state"):
-        return _error(401, "invalid state")
-    nonce = session.get("nonce")
-    redirect_uri = os.getenv(f"{provider.upper()}_REDIRECT_URI")
     try:
-        info = fetch_user_info(provider, code, redirect_uri, nonce)
-    except Exception as exc:  # pragma: no cover - network failures
-        return _error(401, "oauth error", {"reason": str(exc)})
-    email = info.get("email")
-    if not email:
-        return _error(422, "email required")
-    user = upsert_user(
-        email=email,
-        name=info.get("name") or info.get("localizedFirstName"),
-        photo_url=info.get("picture") or info.get("profilePicture"),
-        provider=provider,
-        provider_user_id=info.get("sub") or info.get("id"),
-        last_login=datetime.now(timezone.utc),
-    )
-    token = encode_jwt(user)
-    return jsonify(
-        {
-            "token": token,
-            "user": {"id": user.id, "email": user.email, "name": user.name},
-        }
-    )
+        code = request.args.get("code")
+        state = request.args.get("state")
+        if not code or not state:
+            return _error(400, "missing code or state")
+        if state != session.get("state"):
+            return _error(401, "invalid state")
+        nonce = session.get("nonce")
+        redirect_uri = session.get("redirect_uri") or os.getenv(
+            f"{provider.upper()}_REDIRECT_URI"
+        )
+        try:
+            info = fetch_user_info(provider, code, redirect_uri, nonce)
+        except Exception as exc:  # pragma: no cover - network failures
+            return _error(401, "oauth error", {"reason": str(exc)})
+        email = info.get("email")
+        if not email:
+            return _error(422, "email required")
+        user = upsert_user(
+            email=email,
+            name=info.get("name") or info.get("localizedFirstName"),
+            photo_url=info.get("picture") or info.get("profilePicture"),
+            provider=provider,
+            provider_user_id=info.get("sub") or info.get("id"),
+            last_login=datetime.now(timezone.utc),
+        )
+        token = encode_jwt(user)
+        return jsonify(
+            {
+                "token": token,
+                "user": {"id": user.id, "email": user.email, "name": user.name},
+            }
+        )
+    finally:
+        session.pop("state", None)
+        session.pop("nonce", None)
+        session.pop("redirect_uri", None)
 
 
 @auth_bp.post("/verify")
