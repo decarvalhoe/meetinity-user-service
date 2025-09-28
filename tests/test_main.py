@@ -2,6 +2,9 @@
 
 from datetime import datetime
 
+from src.config import reset_config
+from src.main import create_app
+
 
 def test_health(client):
     response = client.get("/health")
@@ -28,3 +31,34 @@ def test_not_found(client):
 def test_cors_headers(client):
     response = client.get("/health")
     assert response.headers["Access-Control-Allow-Origin"] == "*"
+
+
+def test_custom_cors_origin_allowed():
+    reset_config({"CORS_ORIGINS": "https://allowed.example"})
+    try:
+        app = create_app()
+        app.config.update({"TESTING": True})
+        with app.test_client() as client:
+            response = client.get(
+                "/health", headers={"Origin": "https://allowed.example"}
+            )
+            assert (
+                response.headers["Access-Control-Allow-Origin"]
+                == "https://allowed.example"
+            )
+    finally:
+        reset_config({"CORS_ORIGINS": None})
+
+
+def test_custom_cors_origin_rejected():
+    reset_config({"CORS_ORIGINS": "https://allowed.example"})
+    try:
+        app = create_app()
+        app.config.update({"TESTING": True})
+        with app.test_client() as client:
+            response = client.get(
+                "/health", headers={"Origin": "https://other.example"}
+            )
+            assert "Access-Control-Allow-Origin" not in response.headers
+    finally:
+        reset_config({"CORS_ORIGINS": None})

@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Main application file for the User Service."""
 
-import os
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify
@@ -11,6 +10,10 @@ from werkzeug.exceptions import HTTPException
 from src.auth.oauth import init_oauth
 from src.config import Config, get_config
 from src.routes.auth import auth_bp
+from src.schemas.user import UserSchema
+
+
+user_list_schema = UserSchema(many=True)
 
 
 def create_app(config: Config | None = None) -> Flask:
@@ -57,7 +60,7 @@ def create_app(config: Config | None = None) -> Flask:
     @app.route("/users")
     def users():
         """Placeholder endpoint returning an empty list of users."""
-        return jsonify({"users": []})
+        return jsonify({"users": user_list_schema.dump([])})
 
     app.register_blueprint(auth_bp)
 
@@ -68,5 +71,4 @@ app = create_app()
 
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5001"))
-    app.run(debug=True, port=port)
+    app.run(debug=True, port=app.config["APP_CONFIG"].app_port)

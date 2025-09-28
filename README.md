@@ -25,6 +25,8 @@ The User Service is a comprehensive authentication and user management microserv
 - **Requests**: HTTP client for OAuth provider communication
 - **Python-dotenv**: Environment variable management
 - **Flask-CORS**: Cross-Origin Resource Sharing support
+- **SQLAlchemy**: ORM used for persistence and migrations
+- **Marshmallow**: Declarative serialization layer for API responses
 
 ## Project Status
 
@@ -36,6 +38,8 @@ The User Service is a comprehensive authentication and user management microserv
 ## Configuration
 
 - `CORS_ORIGINS`: comma-separated list of allowed origins for CORS. Defaults to `*`.
+- `APP_PORT`: TCP port used when running `python src/main.py`. Defaults to `5001`.
+- `FLASK_SECRET`: secret key used for Flask session signing.
 - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI`: Google OAuth credentials and callback URL.
 - `LINKEDIN_CLIENT_ID` / `LINKEDIN_CLIENT_SECRET` / `LINKEDIN_REDIRECT_URI`: LinkedIn OAuth credentials and callback URL.
 - `DATABASE_URL`: SQLAlchemy database URL (e.g. `postgresql+psycopg://user:pass@localhost:5432/meetinity`).
@@ -52,6 +56,7 @@ The User Service is a comprehensive authentication and user management microserv
 pip install -r requirements.txt
 alembic upgrade head  # apply DB migrations
 flake8 src tests
+pytest
 pytest --cov=src --cov=tests --cov-report=term-missing --cov-fail-under=90
 ```
 
@@ -59,6 +64,13 @@ pytest --cov=src --cov=tests --cov-report=term-missing --cov-fail-under=90
 
 ```bash
 python src/main.py
+```
+
+or using Flask's CLI:
+
+```bash
+export FLASK_APP=src.main:app
+flask run --port ${APP_PORT:-5001}
 ```
 
 ## Database & Cache Provisioning

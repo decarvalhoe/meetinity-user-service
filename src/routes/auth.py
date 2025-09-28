@@ -17,8 +17,10 @@ from src.auth.oauth import (
 )
 from src.db.session import session_scope
 from src.models.user_repository import UserRepository
+from src.schemas.user import UserSchema
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
+user_schema = UserSchema()
 
 ALLOWED_REDIRECTS = {
     value.strip()
@@ -214,37 +216,4 @@ def _profile_cache_key(user_id: int) -> str:
 def _serialize_user(user) -> Dict[str, Any]:
     """Serialize a user object for JSON responses/caching."""
 
-    def _dt_to_iso(dt: datetime | None) -> str | None:
-        return dt.isoformat() if dt else None
-
-    return {
-        "id": user.id,
-        "email": user.email,
-        "name": user.name,
-        "photo_url": user.photo_url,
-        "title": user.title,
-        "company": user.company,
-        "location": user.location,
-        "provider": user.provider,
-        "provider_user_id": user.provider_user_id,
-        "last_login": _dt_to_iso(user.last_login),
-        "last_active_at": _dt_to_iso(user.last_active_at),
-        "bio": user.bio,
-        "timezone": user.timezone,
-        "is_active": user.is_active,
-        "preferences": {
-            pref.key: pref.value for pref in getattr(user, "preferences", [])
-        },
-        "social_accounts": [
-            {
-                "provider": account.provider,
-                "provider_user_id": account.provider_user_id,
-                "display_name": account.display_name,
-                "profile_url": account.profile_url,
-                "last_connected_at": _dt_to_iso(
-                    account.last_connected_at
-                ),
-            }
-            for account in getattr(user, "social_accounts", [])
-        ],
-    }
+    return user_schema.dump(user)

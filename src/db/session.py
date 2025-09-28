@@ -8,7 +8,12 @@ from typing import Iterator
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
-from sqlalchemy.orm import DeclarativeBase, Session, close_all_sessions, sessionmaker
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Session,
+    close_all_sessions,
+    sessionmaker,
+)
 from sqlalchemy.pool import StaticPool
 
 from src.config import get_config
