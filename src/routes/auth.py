@@ -15,10 +15,10 @@ from src.auth.oauth import (
     generate_nonce,
     generate_state,
 )
-from src.db.session import session_scope
-from src.models.user_repository import UserRepository
-from src.routes.helpers import error_response
+from src.models.repositories import RepositoryError, UserRepository
+from src.routes.helpers import error_response, repository_error_response
 from src.schemas.user import UserSchema, UserVerificationSchema
+from src.services.transactions import transactional_session
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 user_schema = UserSchema()
@@ -98,7 +98,7 @@ def auth_callback(provider: str):
         now = datetime.now(timezone.utc)
         redis_client = current_app.extensions.get("redis_client")
         try:
-            with session_scope() as db_session:
+            with transactional_session(name="auth.oauth") as db_session:
                 repo = UserRepository(db_session)
                 user = repo.upsert_oauth_user(
                     email=email,
@@ -119,6 +119,8 @@ def auth_callback(provider: str):
                 profile = _serialize_user(user)
         except ValueError as exc:
             return error_response(422, str(exc))
+        except RepositoryError as exc:
+            return repository_error_response(exc)
         if redis_client:
             redis_client.setex(
                 _profile_cache_key(user.id),
@@ -177,18 +179,23 @@ def request_verification():
         except ValueError as exc:
             return error_response(422, str(exc))
 
-    with session_scope() as db_session:
-        repo = UserRepository(db_session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        verification = repo.create_verification(
-            user,
-            method=method.strip(),
-            code=code.strip(),
-            expires_at=expires_at,
-        )
-        data = verification_schema.dump(verification)
+    try:
+        with transactional_session(
+            name="auth.verification.request"
+        ) as db_session:
+            repo = UserRepository(db_session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            verification = repo.create_verification(
+                user,
+                method=method.strip(),
+                code=code.strip(),
+                expires_at=expires_at,
+            )
+            data = verification_schema.dump(verification)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     return jsonify({"verification": data}), 201
 
@@ -205,17 +212,22 @@ def confirm_verification():
     if not isinstance(code, str) or not code.strip():
         return error_response(422, "code required")
 
-    with session_scope() as db_session:
-        repo = UserRepository(db_session)
-        verification = repo.get_verification_by_id(verification_id)
-        if verification is None:
-            return error_response(404, "verification not found")
-        success = repo.confirm_verification(
-            verification,
-            provided_code=code.strip(),
-            at=datetime.now(timezone.utc),
-        )
-        data = verification_schema.dump(verification)
+    try:
+        with transactional_session(
+            name="auth.verification.confirm"
+        ) as db_session:
+            repo = UserRepository(db_session)
+            verification = repo.get_verification_by_id(verification_id)
+            if verification is None:
+                return error_response(404, "verification not found")
+            success = repo.confirm_verification(
+                verification,
+                provided_code=code.strip(),
+                at=datetime.now(timezone.utc),
+            )
+            data = verification_schema.dump(verification)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     status = 200 if success else 422
     return jsonify({"success": success, "verification": data}), status
@@ -237,12 +249,15 @@ def profile():
         if cached:
             return jsonify({"user": json.loads(cached)})
 
-    with session_scope() as db_session:
-        repo = UserRepository(db_session)
-        user = repo.get(user_id)
-        if not user:
-            return error_response(404, "user not found")
-        profile = _serialize_user(user)
+    try:
+        with transactional_session(name="auth.profile") as db_session:
+            repo = UserRepository(db_session)
+            user = repo.get(user_id)
+            if not user:
+                return error_response(404, "user not found")
+            profile = _serialize_user(user)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     if redis_client:
         redis_client.setex(
