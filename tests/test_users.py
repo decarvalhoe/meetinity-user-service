@@ -34,6 +34,7 @@ class DummyRedis:
 def seeded_users():
     with session_scope() as session:
         repo = UserRepository(session)
+        now = datetime.now(timezone.utc)
         alice = repo.create_user(
             email="alice@example.com",
             name="Alice",
@@ -61,6 +62,10 @@ def seeded_users():
             skills=["javascript"],
             bio="Enthusiastic engineer",
         )
+        alice.touch_login(now - timedelta(hours=6))
+        carol.touch_login(now - timedelta(hours=2))
+        repo.record_activity(alice, activity_type="login", score_delta=3)
+        repo.record_activity(carol, activity_type="login", score_delta=2)
         yield {"alice": alice, "bob": bob, "carol": carol}
 
 
@@ -104,6 +109,8 @@ def test_update_user(client, seeded_users):
     updated = response.get_json()["user"]
     assert updated["title"] == "Senior Engineer"
     assert "sqlalchemy" in updated["skills"]
+    assert updated["profile_completeness"] >= 30
+    assert updated["trust_score"] >= 0
 
     with session_scope() as session:
         repo = UserRepository(session)
@@ -178,6 +185,26 @@ def test_search_users(client, seeded_users):
     emails = {item["email"] for item in data["items"]}
     assert "carol@example.com" in emails
     assert "alice@example.com" in emails
+    assert "recommendations" in data
+    assert data["recommendation_limit"] >= 1
+    assert any(
+        rec["email"] in {"alice@example.com", "carol@example.com"}
+        for rec in data["recommendations"]
+    )
+
+
+def test_discover_endpoint(client, seeded_users):
+    alice_id = seeded_users["alice"].id
+    response = client.get(
+        "/users/discover",
+        query_string={"user_id": alice_id},
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["context_user_id"] == alice_id
+    assert payload["recommendations"]
+    recommended_emails = {rec["email"] for rec in payload["recommendations"]}
+    assert "carol@example.com" in recommended_emails
 
 
 def test_upsert_preferences_endpoint(client, seeded_users):
@@ -206,6 +233,16 @@ def test_privacy_update_and_tokens(client, seeded_users):
     user = response.get_json()["user"]
     assert user["privacy_settings"]["profile_visibility"] == "network"
     assert sorted(user["active_tokens"]) == ["alpha", "beta", "gamma"]
+    assert user["privacy_level"] in {"medium", "high", "standard"}
+
+
+def test_get_privacy_endpoint(client, seeded_users):
+    user_id = seeded_users["alice"].id
+    response = client.get(f"/users/{user_id}/privacy")
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["user_id"] == user_id
+    assert "privacy_level" in payload
 
 
 def test_activity_logging_and_listing(client, seeded_users):
@@ -221,13 +258,65 @@ def test_activity_logging_and_listing(client, seeded_users):
     listing = client.get(f"/users/{user_id}/activities")
     assert listing.status_code == 200
     payload = listing.get_json()
-    assert payload["total"] == 1
-    assert payload["items"][0]["score_delta"] == 5
+    assert payload["total"] >= 1
+    assert any(item["score_delta"] == 5 for item in payload["items"])
 
     with session_scope() as session:
         repo = UserRepository(session)
         user = repo.get(user_id)
         assert user.engagement_score >= 5
+
+
+def test_verify_endpoint_flow(client, seeded_users):
+    user_id = seeded_users["alice"].id
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        repo.create_verification(user, method="email", code="999999")
+
+    baseline_resp = client.get(f"/users/{user_id}")
+    baseline = baseline_resp.get_json()["user"]["trust_score"]
+
+    wrong = client.post(
+        f"/users/{user_id}/verify",
+        json={"method": "email", "code": "111111"},
+    )
+    assert wrong.status_code == 409
+    assert wrong.get_json()["reason"] == "invalid_code"
+
+    success = client.post(
+        f"/users/{user_id}/verify",
+        json={"method": "email", "code": "999999"},
+    )
+    assert success.status_code == 200
+    payload = success.get_json()
+    assert payload["verified"] is True
+    assert payload["verification"]["status"] == "verified"
+    assert payload["user"]["trust_score"] > baseline
+
+
+def test_deactivate_flow(client, seeded_users):
+    user_id = seeded_users["carol"].id
+    reactivation_at = (
+        datetime.now(timezone.utc) + timedelta(days=7)
+    ).isoformat()
+
+    response = client.post(
+        f"/users/{user_id}/deactivate",
+        json={"reactivate_at": reactivation_at},
+    )
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["user"]["is_active"] is False
+    assert payload["deactivated_at"] is not None
+    assert payload["reactivation_at"] is not None
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        stored = repo.get(user_id)
+        assert stored is not None
+        assert stored.deactivated_at is not None
+        assert stored.reactivation_at is not None
 
 
 def test_session_management_flow(client, seeded_users):

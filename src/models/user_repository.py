@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -17,7 +18,8 @@ from src.models.user import (
     UserSocialAccount,
     UserVerification,
 )
-from src.utils.lists import encode_string_list
+from src.services.profile_metrics import update_profile_metrics
+from src.utils.lists import decode_string_list, encode_string_list
 
 
 SORT_FIELDS = {
@@ -97,6 +99,8 @@ class UserRepository:
             connected_at=last_login,
         )
 
+        self._apply_metrics(user, now=last_login)
+
         if created:
             self.session.flush()
 
@@ -140,6 +144,7 @@ class UserRepository:
             is_active=is_active,
         )
         self.session.add(user)
+        self._apply_metrics(user)
         self.session.flush()
         return user
 
@@ -177,6 +182,7 @@ class UserRepository:
         if "active_tokens" in data and data["active_tokens"] is not None:
             user.active_tokens = self._normalize_tokens(data["active_tokens"])
 
+        self._apply_metrics(user)
         self.session.flush()
         return user
 
@@ -216,23 +222,64 @@ class UserRepository:
         per_page: int,
         sort: Tuple[str, str],
         filters: dict[str, object],
-    ) -> Tuple[list[User], int]:
+        include_recommendations: bool = False,
+        base_user: Optional[User] = None,
+        recommendation_limit: int = 5,
+    ) -> Tuple[list[User], int, list[User]]:
         """Search users by free-text query and filters."""
 
         stmt = select(User).where(User.is_active.is_(True))
         stmt = self._apply_filters(stmt, filters)
-        pattern = f"%{query.lower()}%"
-        stmt = stmt.where(
-            or_(
-                func.lower(User.name).like(pattern),
-                func.lower(User.title).like(pattern),
-                func.lower(User.company).like(pattern),
-                func.lower(User.bio).like(pattern),
-                func.lower(func.coalesce(User.skills, "")).like(pattern),
-                func.lower(func.coalesce(User.interests, "")).like(pattern),
+        if query:
+            pattern = f"%{query.lower()}%"
+            stmt = stmt.where(
+                or_(
+                    func.lower(User.name).like(pattern),
+                    func.lower(User.title).like(pattern),
+                    func.lower(User.company).like(pattern),
+                    func.lower(User.bio).like(pattern),
+                    func.lower(
+                        func.coalesce(User.skills, "")
+                    ).like(pattern),
+                    func.lower(
+                        func.coalesce(User.interests, "")
+                    ).like(pattern),
+                )
             )
-        )
-        return self._paginate(stmt, page, per_page, sort)
+        items, total = self._paginate(stmt, page, per_page, sort)
+
+        recommendations: list[User] = []
+        if include_recommendations:
+            tokens = self._collect_similarity_tokens(
+                query=query,
+                filters=filters,
+                base_user=base_user,
+            )
+            limit_value = max(1, recommendation_limit)
+            exclude_ids: Set[int] = set()
+            if base_user is not None:
+                exclude_ids.add(base_user.id)
+            recommendations = self._recommend_users(
+                tokens=tokens,
+                base_user=base_user,
+                exclude_ids=exclude_ids,
+                limit=limit_value,
+            )
+            combined = list(recommendations) + list(items)
+            deduped: list[User] = []
+            seen: Set[int] = set()
+            for candidate in combined:
+                if candidate.id in seen:
+                    continue
+                if base_user is not None and candidate.id == base_user.id:
+                    continue
+                seen.add(candidate.id)
+                deduped.append(candidate)
+                if len(deduped) >= limit_value:
+                    break
+            recommendations = deduped
+
+        return items, total, recommendations
 
     def set_preferences(
         self,
@@ -258,9 +305,19 @@ class UserRepository:
         self.session.flush()
         return user
 
-    def deactivate(self, user: User) -> None:
+    def deactivate(
+        self,
+        user: User,
+        *,
+        reactivation_at: Optional[datetime] = None,
+    ) -> User:
         user.is_active = False
+        if reactivation_at is not None and reactivation_at.tzinfo is None:
+            reactivation_at = reactivation_at.replace(tzinfo=timezone.utc)
+        user.reactivation_at = reactivation_at
+        self._apply_metrics(user)
         self.session.flush()
+        return user
 
     # ------------------------------------------------------------------
     # Extended aggregates
@@ -278,6 +335,7 @@ class UserRepository:
             user.privacy_settings = dict(privacy_settings)
         if active_tokens is not None:
             user.active_tokens = self._normalize_tokens(active_tokens)
+        self._apply_metrics(user)
         self.session.flush()
         return user
 
@@ -301,6 +359,7 @@ class UserRepository:
             new_score = (user.engagement_score or 0) + score_delta
             user.engagement_score = max(0, new_score)
         self.session.add(entry)
+        self._apply_metrics(user, now=entry.created_at)
         self.session.flush()
         return entry
 
@@ -389,6 +448,8 @@ class UserRepository:
             return False
         verification.status = "verified"
         verification.verified_at = now
+        if verification.user is not None:
+            self._apply_metrics(verification.user, now=now)
         self.session.flush()
         return True
 
@@ -551,6 +612,118 @@ class UserRepository:
                 stmt = stmt.where(User.skills.contains(f'"{skill}"'))
         return stmt
 
+    def _collect_similarity_tokens(
+        self,
+        *,
+        query: str,
+        filters: dict[str, object],
+        base_user: Optional[User],
+    ) -> Set[str]:
+        tokens: Set[str] = set()
+        tokens.update(self._tokenize(query))
+        skills_filter = filters.get("skills")
+        if isinstance(skills_filter, Sequence):
+            tokens.update(
+                str(skill).lower()
+                for skill in skills_filter
+                if skill
+            )
+        if base_user is not None:
+            tokens.update(
+                token
+                for token in decode_string_list(base_user.skills)
+                if token
+            )
+            tokens.update(
+                token
+                for token in decode_string_list(base_user.interests)
+                if token
+            )
+            for attribute in ("industry", "location", "title"):
+                value = getattr(base_user, attribute, None)
+                if value:
+                    tokens.update(self._tokenize(str(value)))
+        return {token.strip().lower() for token in tokens if token}
+
+    def _recommend_users(
+        self,
+        *,
+        tokens: Set[str],
+        base_user: Optional[User],
+        exclude_ids: Set[int],
+        limit: int,
+    ) -> list[User]:
+        stmt = select(User).where(User.is_active.is_(True))
+        if base_user is not None:
+            stmt = stmt.where(User.id != base_user.id)
+        stmt = stmt.order_by(
+            User.last_active_at.desc().nullslast(),
+            User.updated_at.desc(),
+            User.id.asc(),
+        )
+        candidates = (
+            self.session.execute(stmt.limit(100)).scalars().unique().all()
+        )
+
+        scored: list[tuple[float, User]] = []
+        now = datetime.now(timezone.utc)
+        for candidate in candidates:
+            if candidate.id in exclude_ids:
+                continue
+            similarity = self._compute_similarity_score(candidate, tokens)
+            recency = self._recency_score(candidate, now)
+            total_score = similarity * 70 + recency
+            if tokens and similarity == 0 and recency == 0:
+                continue
+            scored.append((total_score, candidate))
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [candidate for _, candidate in scored[:limit]]
+
+    def _compute_similarity_score(self, user: User, tokens: Set[str]) -> float:
+        if not tokens:
+            return 0.0
+        user_tokens: Set[str] = set()
+        user_tokens.update(
+            token.lower()
+            for token in decode_string_list(user.skills)
+            if token
+        )
+        user_tokens.update(
+            token.lower()
+            for token in decode_string_list(user.interests)
+            if token
+        )
+        for attribute in (user.title, user.industry, user.location):
+            if attribute:
+                user_tokens.update(self._tokenize(str(attribute)))
+        matches = sum(1 for token in tokens if token in user_tokens)
+        if not matches:
+            return 0.0
+        return matches / len(tokens)
+
+    @staticmethod
+    def _recency_score(user: User, now: datetime) -> float:
+        reference = (
+            user.last_active_at
+            or user.last_login
+            or user.updated_at
+            or user.created_at
+        )
+        if reference is None:
+            return 0.0
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        delta = now - reference
+        days = delta.total_seconds() / 86400
+        return max(0.0, 100.0 - min(100.0, days))
+
+    @staticmethod
+    def _tokenize(value: str | None) -> list[str]:
+        if not value:
+            return []
+        return [token for token in re.split(r"\W+", value.lower()) if token]
+
     def _paginate(
         self,
         stmt,
@@ -587,3 +760,7 @@ class UserRepository:
             seen.add(token_str)
             normalized.append(token_str)
         return normalized
+
+    @staticmethod
+    def _apply_metrics(user: User, *, now: datetime | None = None) -> None:
+        update_profile_metrics(user, now=now)
