@@ -1,19 +1,22 @@
-"""JWT handler for the User Service.
+"""JWT helper utilities for encoding/decoding tokens and enforcing auth."""
 
-This file provides functions for encoding and decoding JSON Web Tokens (JWTs)
-and a decorator for requiring JWT authentication on routes.
-"""
-
-import os
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 
 import jwt
-from flask import jsonify, request
+from flask import current_app, has_app_context, jsonify, request
 
-JWT_SECRET = os.getenv("JWT_SECRET", "change_me")
-JWT_ALGO = os.getenv("JWT_ALGO", "HS256")
-JWT_TTL_MIN = int(os.getenv("JWT_TTL_MIN", "60"))
+from src.config import Config, get_config
+
+
+def _config() -> Config:
+    """Return the active application configuration."""
+
+    if has_app_context():
+        app_config = current_app.config.get("APP_CONFIG")
+        if isinstance(app_config, Config):
+            return app_config
+    return get_config()
 
 
 def encode_jwt(user) -> str:
@@ -25,15 +28,20 @@ def encode_jwt(user) -> str:
     Returns:
         str: The encoded JWT.
     """
+    config = _config()
     now = datetime.now(timezone.utc)
     payload = {
         "sub": user.id,
         "email": user.email,
         "provider": user.provider,
         "iat": now,
-        "exp": now + timedelta(minutes=JWT_TTL_MIN),
+        "exp": now + timedelta(minutes=config.jwt_ttl_minutes),
     }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+    return jwt.encode(
+        payload,
+        config.jwt_secret,
+        algorithm=config.jwt_algorithm,
+    )
 
 
 def decode_jwt(token: str):
@@ -45,7 +53,12 @@ def decode_jwt(token: str):
     Returns:
         dict: The decoded JWT payload.
     """
-    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+    config = _config()
+    return jwt.decode(
+        token,
+        config.jwt_secret,
+        algorithms=[config.jwt_algorithm],
+    )
 
 
 def require_auth(fn):
