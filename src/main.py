@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Main application file for the User Service."""
 
+import os
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify
@@ -10,10 +11,8 @@ from werkzeug.exceptions import HTTPException
 from src.auth.oauth import init_oauth
 from src.config import Config, get_config
 from src.routes.auth import auth_bp
-from src.schemas.user import UserSchema
-
-
-user_list_schema = UserSchema(many=True)
+from src.routes.helpers import error_response
+from src.routes.users import users_bp
 
 
 def create_app(config: Config | None = None) -> Flask:
@@ -28,6 +27,12 @@ def create_app(config: Config | None = None) -> Flask:
     app.config["APP_CONFIG"] = config
 
     CORS(app, origins=config.cors_origins)
+    upload_folder = app.config.setdefault(
+        "UPLOAD_FOLDER",
+        os.path.join(app.instance_path, "uploads"),
+    )
+    os.makedirs(upload_folder, exist_ok=True)
+    app.config.setdefault("UPLOAD_URL_PREFIX", "/uploads")
     if config.redis:
         app.extensions["redis_client"] = config.redis
     init_oauth(app)
@@ -35,16 +40,13 @@ def create_app(config: Config | None = None) -> Flask:
     @app.errorhandler(HTTPException)
     def handle_http_exception(err: HTTPException):
         """Handle HTTP exceptions by returning JSON."""
-        response = jsonify({"error": err.description})
-        response.status_code = err.code
-        return response
+        message = err.description or err.name
+        return error_response(err.code or 500, message)
 
     @app.errorhandler(Exception)
     def handle_exception(err: Exception):
         """Handle unexpected exceptions by returning JSON."""
-        response = jsonify({"error": str(err)})
-        response.status_code = 500
-        return response
+        return error_response(500, str(err))
 
     @app.route("/health")
     def health():
@@ -57,12 +59,8 @@ def create_app(config: Config | None = None) -> Flask:
             }
         )
 
-    @app.route("/users")
-    def users():
-        """Placeholder endpoint returning an empty list of users."""
-        return jsonify({"users": user_list_schema.dump([])})
-
     app.register_blueprint(auth_bp)
+    app.register_blueprint(users_bp)
 
     return app
 

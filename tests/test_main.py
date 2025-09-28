@@ -18,14 +18,15 @@ def test_health(client):
 def test_users_endpoint(client):
     response = client.get("/users")
     assert response.status_code == 200
-    assert response.get_json() == {"users": []}
+    body = response.get_json()
+    assert body == {"items": [], "page": 1, "per_page": 20, "total": 0}
 
 
 def test_not_found(client):
     response = client.get("/missing")
     assert response.status_code == 404
     payload = response.get_json()
-    assert payload["error"]
+    assert payload["error"]["code"] == 404
 
 
 def test_cors_headers(client):

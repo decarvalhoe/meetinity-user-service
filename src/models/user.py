@@ -8,6 +8,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -23,6 +24,10 @@ class User(Base):
     """Primary user record."""
 
     __tablename__ = "users"
+    __table_args__ = (
+        Index("ix_users_industry_location", "industry", "location"),
+        Index("ix_users_created_at", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(
         Integer,
@@ -37,6 +42,9 @@ class User(Base):
     title: Mapped[str | None] = mapped_column(String(255))
     company: Mapped[str | None] = mapped_column(String(255))
     location: Mapped[str | None] = mapped_column(String(255))
+    industry: Mapped[str | None] = mapped_column(String(255))
+    linkedin_url: Mapped[str | None] = mapped_column(String(512))
+    experience_years: Mapped[int | None] = mapped_column(Integer())
     provider: Mapped[str | None] = mapped_column(String(50))
     provider_user_id: Mapped[str | None] = mapped_column(
         String(255), index=True
@@ -54,6 +62,8 @@ class User(Base):
         server_default="0",
     )
     bio: Mapped[str | None] = mapped_column(Text())
+    skills: Mapped[str | None] = mapped_column(Text())
+    interests: Mapped[str | None] = mapped_column(Text())
     timezone: Mapped[str | None] = mapped_column(String(64))
     is_active: Mapped[bool] = mapped_column(
         Boolean,
