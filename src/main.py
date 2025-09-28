@@ -15,6 +15,7 @@ from src.routes.auth import auth_bp
 from src.routes.helpers import error_response
 from src.routes.users import users_bp
 from src.services.cache import CacheService
+from src.utils.encryption import ApplicationEncryptor
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -59,6 +60,11 @@ def create_app(config: Config | None = None) -> Flask:
     app.extensions["cache_service"] = CacheService(
         app.extensions.get("redis_client"),
         config.redis_cache_ttl,
+    )
+    app.extensions["encryptor"] = ApplicationEncryptor.from_keys(
+        primary_key=config.encryption_primary_key,
+        fallback_keys=config.encryption_fallback_keys,
+        rotation_days=config.encryption_rotation_days,
     )
     init_oauth(app)
 

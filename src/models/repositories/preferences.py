@@ -46,7 +46,14 @@ class UserPreferenceRepository(SQLAlchemyRepository):
         if privacy_settings is not None:
             user.privacy_settings = dict(privacy_settings)
         if active_tokens is not None:
-            user.active_tokens = normalize_tokens(active_tokens)
+            normalized = normalize_tokens(active_tokens)
+            if self._encryptor:
+                hashed = [
+                    self._encryptor.hash_token(token) for token in normalized
+                ]
+                user.active_tokens = hashed
+            else:
+                user.active_tokens = normalized
         self._flush()
         self._invalidate_profile_cache(user.id)
         return user

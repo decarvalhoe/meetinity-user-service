@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
+from flask import current_app, has_app_context
+
+from src.config import get_config
+from src.utils.encryption import ApplicationEncryptor
+
 from sqlalchemy.orm import Session
 
 from .activity import UserActivityRepository
@@ -26,15 +31,40 @@ class UserRepository:
         session: Session,
         *,
         cache_hooks: "CacheHooks | None" = None,
+        encryptor: "ApplicationEncryptor | None" = None,
     ) -> None:
+        if encryptor is None:
+            if has_app_context():
+                encryptor = current_app.extensions.get("encryptor")
+            if encryptor is None:
+                config = get_config()
+                if config.encryption_primary_key:
+                    encryptor = ApplicationEncryptor.from_keys(
+                        primary_key=config.encryption_primary_key,
+                        fallback_keys=config.encryption_fallback_keys,
+                        rotation_days=config.encryption_rotation_days,
+                    )
         self.session = session
+        self._encryptor = encryptor
         self._repositories: Iterable[object] = (
-            UserCoreRepository(session, cache_hooks=cache_hooks),
-            UserPreferenceRepository(session, cache_hooks=cache_hooks),
-            UserActivityRepository(session, cache_hooks=cache_hooks),
-            UserConnectionRepository(session, cache_hooks=cache_hooks),
-            UserSessionRepository(session, cache_hooks=cache_hooks),
-            UserVerificationRepository(session, cache_hooks=cache_hooks),
+            UserCoreRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            ),
+            UserPreferenceRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            ),
+            UserActivityRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            ),
+            UserConnectionRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            ),
+            UserSessionRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            ),
+            UserVerificationRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            ),
         )
 
     def __getattr__(self, name: str) -> Any:

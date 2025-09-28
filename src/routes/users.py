@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Mapping, Tuple, TypeVar
 
 from flask import Blueprint, Response, current_app, jsonify, request
@@ -15,8 +15,10 @@ from src.schemas.user import (
     UserConnectionSchema,
     UserSchema,
     UserSessionSchema,
+    UserVerificationSchema,
     UserUpdateSchema,
 )
+from src.services.audit import log_audit_event
 from src.services.uploads import UploadError, save_user_photo
 from src.services.transactions import transactional_session
 from src.utils.lists import normalize_string_list
@@ -32,6 +34,7 @@ session_schema = UserSessionSchema()
 sessions_schema = UserSessionSchema(many=True)
 connection_schema = UserConnectionSchema()
 connections_schema = UserConnectionSchema(many=True)
+verification_schema = UserVerificationSchema()
 
 DEFAULT_SORT = ("created_at", "desc")
 ALLOWED_SORT_FIELDS = {
@@ -55,7 +58,10 @@ def _execute_user_repo(
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repository = UserRepository(session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repository = UserRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
             return handler(repository), None
     except RepositoryError as exc:
         return None, repository_error_response(exc)
@@ -135,7 +141,10 @@ def update_user(user_id: int):
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repo = UserRepository(session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -157,7 +166,10 @@ def delete_user(user_id: int):
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repo = UserRepository(session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -191,7 +203,10 @@ def upsert_preferences(user_id: int):
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repo = UserRepository(session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -225,7 +240,10 @@ def update_privacy(user_id: int):
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repo = UserRepository(session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -342,7 +360,8 @@ def list_activities(user_id: int):
 
     try:
         with transactional_session(name="users.activities.list") as session:
-            repo = UserRepository(session)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(session, encryptor=encryptor)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -487,6 +506,93 @@ def revoke_session(user_id: int, session_id: int):
         return repository_error_response(exc)
 
     return "", 204
+
+
+@users_bp.get("/<int:user_id>/export")
+def export_user(user_id: int):
+    """Provide a full export of the user profile and related records."""
+
+    try:
+        with transactional_session(name="users.export") as session:
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            payload = {
+                "user": user_schema.dump(user),
+                "sessions": sessions_schema.dump(user.sessions),
+                "activities": activities_schema.dump(user.activities),
+                "connections": connections_schema.dump(user.connections),
+                "verifications": [
+                    verification_schema.dump(entry)
+                    for entry in user.verifications
+                ],
+            }
+            log_audit_event(
+                "users.export",
+                session=session,
+                user_id=user.id,
+                actor=str(user.email),
+                details={
+                    "sessions": len(payload["sessions"]),
+                    "activities": len(payload["activities"]),
+                },
+            )
+    except RepositoryError as exc:
+        return repository_error_response(exc)
+
+    payload["exported_at"] = datetime.now(timezone.utc).isoformat()
+    return jsonify(payload)
+
+
+@users_bp.post("/<int:user_id>/erase")
+def erase_user(user_id: int):
+    """Pseudonymize a user's data and schedule deferred destruction."""
+
+    config = current_app.config.get("APP_CONFIG")
+    retention_days = getattr(config, "account_retention_days", 30)
+    purge_after = datetime.now(timezone.utc) + timedelta(days=retention_days)
+
+    try:
+        with transactional_session(name="users.erase") as session:
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            sanitized = repo.pseudonymize_user(user, purge_after=purge_after)
+            result = user_schema.dump(sanitized)
+            log_audit_event(
+                "users.erase",
+                session=session,
+                user_id=user.id,
+                actor=str(user.email),
+                details={
+                    "scheduled_purge_at": (
+                        sanitized.scheduled_purge_at.isoformat()
+                        if sanitized.scheduled_purge_at
+                        else None
+                    ),
+                },
+            )
+    except RepositoryError as exc:
+        return repository_error_response(exc)
+
+    result["retention_days"] = retention_days
+    return jsonify({"user": result}), 202
 
 
 @users_bp.post("/<int:user_id>/connections")

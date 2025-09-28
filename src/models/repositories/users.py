@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional, Sequence, Tuple
+
+import secrets
 
 from sqlalchemy import func, or_, select
 
@@ -158,7 +160,13 @@ class UserCoreRepository(SQLAlchemyRepository):
         if "privacy_settings" in data and data["privacy_settings"] is not None:
             user.privacy_settings = dict(data["privacy_settings"])
         if "active_tokens" in data and data["active_tokens"] is not None:
-            user.active_tokens = normalize_tokens(data["active_tokens"])
+            tokens = normalize_tokens(data["active_tokens"])
+            if self._encryptor:
+                user.active_tokens = [
+                    self._encryptor.hash_token(token) for token in tokens
+                ]
+            else:
+                user.active_tokens = tokens
 
         self._flush()
         self._invalidate_profile_cache(user.id)
@@ -182,9 +190,87 @@ class UserCoreRepository(SQLAlchemyRepository):
     @repository_method
     def deactivate(self, user: User) -> None:
         user.is_active = False
+        now = datetime.now(timezone.utc)
+        user.deactivated_at = user.deactivated_at or now
+        if user.scheduled_purge_at is None and self._encryptor:
+            retention = getattr(self._encryptor, "rotation_days", 90)
+            user.scheduled_purge_at = now + timedelta(days=retention)
         self._flush()
         self._invalidate_profile_cache(user.id)
         self._invalidate_listing_cache()
+
+    @repository_method
+    def pseudonymize_user(
+        self,
+        user: User,
+        *,
+        purge_after: Optional[datetime] = None,
+    ) -> User:
+        now = datetime.now(timezone.utc)
+        if purge_after is not None and purge_after.tzinfo is None:
+            purge_after = purge_after.replace(tzinfo=timezone.utc)
+        if purge_after is None and self._encryptor:
+            purge_after = now + timedelta(days=self._encryptor.rotation_days)
+        token = secrets.token_hex(6)
+        user.email = f"anon+{user.id}-{token}@anonymized.local"
+        user.name = None
+        user.photo_url = None
+        user.title = None
+        user.company = None
+        user.location = None
+        user.industry = None
+        user.linkedin_url = None
+        user.bio = None
+        user.skills = None
+        user.interests = None
+        user.timezone = None
+        user.provider_user_id = None
+        user.provider = None
+        user.privacy_settings = {}
+        user.active_tokens = []
+        for preference in list(user.preferences):
+            preference.value = None
+        for activity in list(user.activities):
+            activity.description = None
+        for verification in list(user.verifications):
+            if self._encryptor:
+                verification.code = self._encryptor.hash_token(
+                    f"verification-{verification.id}-{now.timestamp()}"
+                )
+            else:
+                verification.code = "revoked"
+            verification.status = "revoked"
+            verification.attempts = 0
+            expires_at = verification.expires_at
+            if expires_at is not None and expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            verification.expires_at = (
+                now if not expires_at or expires_at > now else expires_at
+            )
+            verification.verified_at = None
+        for connection in list(user.connections):
+            connection.external_reference = None
+            connection.attributes = None
+            connection.status = "deleted"
+        for session in list(user.sessions):
+            session.encrypted_payload = None
+            session.ip_address = None
+            session.user_agent = None
+            session.revoked_at = session.revoked_at or now
+            if self._encryptor:
+                session.session_token = self._encryptor.hash_token(
+                    f"revoked-{session.id}-{now.timestamp()}"
+                )
+            else:
+                session.session_token = f"revoked-{session.id}"
+        user.is_active = False
+        user.deactivated_at = user.deactivated_at or now
+        user.pseudonymized_at = now
+        user.scheduled_purge_at = purge_after
+        self._flush()
+        self._invalidate_profile_cache(user.id)
+        self._invalidate_listing_cache()
+        return user
 
     @repository_method
     def bulk_import_users(
@@ -248,11 +334,18 @@ class UserCoreRepository(SQLAlchemyRepository):
                 user.skills = encode_string_list(payload.get("skills"))
             if "interests" in payload:
                 user.interests = encode_string_list(payload.get("interests"))
-            if (
-                "active_tokens" in payload
-                and payload["active_tokens"] is not None
-            ):
-                user.active_tokens = normalize_tokens(payload["active_tokens"])
+                if (
+                    "active_tokens" in payload
+                    and payload["active_tokens"] is not None
+                ):
+                    tokens = normalize_tokens(payload["active_tokens"])
+                    if self._encryptor:
+                        user.active_tokens = [
+                            self._encryptor.hash_token(token)
+                            for token in tokens
+                        ]
+                    else:
+                        user.active_tokens = tokens
             if (
                 "privacy_settings" in payload
                 and payload["privacy_settings"] is not None

@@ -4,9 +4,11 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import select
 
 from src.auth.oauth import generate_nonce, generate_state
 from src.db.session import session_scope
+from src.models.audit import AuditLog
 from src.models.repositories import RepositoryError, UserRepository
 from src.services.cache import CacheService
 
@@ -93,6 +95,14 @@ def test_google_flow(client, stubbed_google):
         stored = repo.get_by_email("test@example.com")
         assert stored is not None
         assert stored.login_count == 1
+        callback_logs = session.execute(
+            select(AuditLog).where(AuditLog.event == "auth.callback.success")
+        ).scalars().all()
+        assert any(log.user_id == stored.id for log in callback_logs)
+        verify_logs = session.execute(
+            select(AuditLog).where(AuditLog.event == "auth.verify.success")
+        ).scalars().all()
+        assert verify_logs
 
 
 def test_linkedin_flow(client, monkeypatch):
@@ -340,6 +350,20 @@ def test_verification_request_and_confirm(client):
     assert payload["success"] is True
     assert payload["verification"]["status"] == "verified"
 
+    with session_scope() as session:
+        request_logs = session.execute(
+            select(AuditLog).where(
+                AuditLog.event == "auth.verification.request"
+            )
+        ).scalars().all()
+        assert request_logs
+        confirm_logs = session.execute(
+            select(AuditLog).where(
+                AuditLog.event == "auth.verification.confirm"
+            )
+        ).scalars().all()
+        assert any(log.details.get("success") for log in confirm_logs)
+
 
 def test_verification_rejects_wrong_code(client):
     with session_scope() as session:
@@ -361,3 +385,11 @@ def test_verification_rejects_wrong_code(client):
     assert confirm_resp.status_code == 422
     payload = confirm_resp.get_json()
     assert payload["success"] is False
+
+    with session_scope() as session:
+        confirm_logs = session.execute(
+            select(AuditLog).where(
+                AuditLog.event == "auth.verification.confirm"
+            )
+        ).scalars().all()
+        assert any(not log.details.get("success") for log in confirm_logs)

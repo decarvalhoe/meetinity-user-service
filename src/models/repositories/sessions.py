@@ -26,9 +26,12 @@ class UserSessionRepository(SQLAlchemyRepository):
         user_agent: Optional[str] = None,
         expires_at: Optional[datetime] = None,
     ) -> UserSession:
+        stored_token = session_token
+        if self._encryptor:
+            stored_token = self._encryptor.hash_token(session_token)
         record = UserSession(
             user=user,
-            session_token=session_token,
+            session_token=stored_token,
             encrypted_payload=encrypted_payload,
             ip_address=ip_address,
             user_agent=user_agent,
@@ -54,7 +57,15 @@ class UserSessionRepository(SQLAlchemyRepository):
 
     @repository_method
     def get_session_by_token(self, token: str) -> Optional[UserSession]:
-        stmt = select(UserSession).where(UserSession.session_token == token)
+        if self._encryptor:
+            candidates = self._encryptor.token_candidates(token)
+            stmt = select(UserSession).where(
+                UserSession.session_token.in_(candidates)
+            )
+        else:
+            stmt = select(UserSession).where(
+                UserSession.session_token == token
+            )
         return self.session.execute(stmt).scalar_one_or_none()
 
     @repository_method

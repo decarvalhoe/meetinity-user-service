@@ -1,6 +1,7 @@
 """Model exports for convenience."""
 
 from src.db.session import Base
+from src.models.audit import AuditLog
 from src.models.user import (
     User,
     UserActivity,
@@ -20,4 +21,5 @@ __all__ = [
     "UserVerification",
     "UserConnection",
     "UserSession",
+    "AuditLog",
 ]

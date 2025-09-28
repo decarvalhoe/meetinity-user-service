@@ -10,8 +10,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.db.session import session_scope
+from src.models.audit import AuditLog
 from src.models.repositories import RepositoryError, UserRepository
 from src.services.cache import CacheService
+from sqlalchemy import select
 
 
 class DummyRedis:
@@ -278,7 +280,14 @@ def test_privacy_update_and_tokens(client, seeded_users):
     assert response.status_code == 200
     user = response.get_json()["user"]
     assert user["privacy_settings"]["profile_visibility"] == "network"
-    assert sorted(user["active_tokens"]) == ["alpha", "beta", "gamma"]
+    encryptor = client.application.extensions["encryptor"]
+    expected_tokens = sorted(
+        {
+            encryptor.hash_token(token.strip())
+            for token in ("alpha", "beta", "gamma")
+        }
+    )
+    assert sorted(user["active_tokens"]) == expected_tokens
 
 
 def test_activity_logging_and_listing(client, seeded_users):
@@ -321,7 +330,9 @@ def test_session_management_flow(client, seeded_users):
     assert listing.status_code == 200
     items = listing.get_json()["items"]
     assert len(items) == 1
-    assert items[0]["session_token"] == "tok-123"
+    token_display = items[0]["session_token"]
+    assert token_display != "tok-123"
+    assert "…" in token_display
 
     revoke = client.delete(f"/users/{user_id}/sessions/{session_id}")
     assert revoke.status_code == 204
@@ -330,6 +341,76 @@ def test_session_management_flow(client, seeded_users):
     assert listing_after.status_code == 200
     stored = listing_after.get_json()["items"][0]
     assert stored["revoked_at"] is not None
+
+    encryptor = client.application.extensions["encryptor"]
+    with session_scope() as session:
+        repo = UserRepository(session)
+        session_record = repo.get_session_by_id(session_id)
+        assert session_record is not None
+        assert session_record.session_token != "tok-123"
+        assert encryptor.verify_token("tok-123", session_record.session_token)
+
+
+def test_gdpr_export_endpoint(client, seeded_users):
+    user_id = seeded_users["alice"].id
+    resp = client.get(f"/users/{user_id}/export")
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["user"]["email"] == "alice@example.com"
+    assert "exported_at" in body
+
+    with session_scope() as session:
+        export_logs = session.execute(
+            select(AuditLog).where(AuditLog.event == "users.export")
+        ).scalars().all()
+        assert any(log.user_id == user_id for log in export_logs)
+
+
+def test_gdpr_erase_pseudonymizes_and_logs(client, seeded_users):
+    user_id = seeded_users["bob"].id
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        repo.create_session(user, session_token="erase-token")
+        repo.record_activity(
+            user,
+            activity_type="login",
+            description="Login from Paris",
+        )
+        repo.create_verification(
+            user,
+            method="email",
+            code="123456",
+            expires_at=datetime.now(timezone.utc) + timedelta(days=1),
+        )
+
+    resp = client.post(f"/users/{user_id}/erase")
+    assert resp.status_code == 202
+    payload = resp.get_json()["user"]
+    assert payload["email"].startswith("anon+")
+    assert payload["is_active"] is False
+    assert payload["pseudonymized_at"] is not None
+    assert payload["scheduled_purge_at"] is not None
+    assert payload["active_tokens"] == []
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        assert user is not None
+        assert user.email.startswith("anon+")
+        assert user.sessions[0].encrypted_payload is None
+        assert user.sessions[0].session_token != "erase-token"
+        assert all(pref.value is None for pref in user.preferences)
+        assert all(
+            activity.description is None for activity in user.activities
+        )
+        audit_logs = session.execute(
+            select(AuditLog).where(
+                AuditLog.event == "users.erase",
+                AuditLog.user_id == user_id,
+            )
+        ).scalars().all()
+        assert audit_logs
 
 
 def test_connection_crud(client, seeded_users):

@@ -17,6 +17,7 @@ from src.auth.oauth import (
 from src.models.repositories import RepositoryError, UserRepository
 from src.routes.helpers import error_response, repository_error_response
 from src.schemas.user import UserSchema, UserVerificationSchema
+from src.services.audit import log_audit_event
 from src.services.transactions import transactional_session
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -41,6 +42,11 @@ def auth_start(provider: str):
         Response: A JSON response with the authentication URL.
     """
     if provider not in {"google", "linkedin"}:
+        log_audit_event(
+            "auth.start.invalid_provider",
+            actor=provider,
+            details={"path": f"/auth/{provider}"},
+        )
         return error_response(400, "bad provider")
     data = request.get_json(silent=True) or {}
     default_redirect_uri = os.getenv(f"{provider.upper()}_REDIRECT_URI")
@@ -61,6 +67,11 @@ def auth_start(provider: str):
     if nonce:
         session["nonce"] = nonce
     url = build_auth_url(provider, redirect_uri, state, nonce)
+    log_audit_event(
+        "auth.start",
+        actor=provider,
+        details={"redirect_uri": redirect_uri, "state": state},
+    )
     return jsonify({"auth_url": url})
 
 
@@ -75,13 +86,28 @@ def auth_callback(provider: str):
         Response: A JSON response with the JWT and user information.
     """
     if provider not in {"google", "linkedin"}:
+        log_audit_event(
+            "auth.callback.invalid_provider",
+            actor=provider,
+            details={"path": f"/auth/{provider}/callback"},
+        )
         return error_response(400, "bad provider")
     try:
         code = request.args.get("code")
         state = request.args.get("state")
         if not code or not state:
+            log_audit_event(
+                "auth.callback.missing_code",
+                actor=provider,
+                details={"state": state},
+            )
             return error_response(400, "missing code or state")
         if state != session.get("state"):
+            log_audit_event(
+                "auth.callback.invalid_state",
+                actor=provider,
+                details={"expected": session.get("state"), "received": state},
+            )
             return error_response(401, "invalid state")
         nonce = session.get("nonce")
         redirect_uri = session.get("redirect_uri") or os.getenv(
@@ -90,9 +116,19 @@ def auth_callback(provider: str):
         try:
             info = fetch_user_info(provider, code, redirect_uri, nonce)
         except Exception as exc:  # pragma: no cover - network failures
+            log_audit_event(
+                "auth.callback.fetch_failed",
+                actor=provider,
+                details={"reason": str(exc)},
+            )
             return error_response(401, "oauth error", {"reason": str(exc)})
         email = info.get("email")
         if not email:
+            log_audit_event(
+                "auth.callback.missing_email",
+                actor=provider,
+                details={"info": list(info.keys())},
+            )
             return error_response(422, "email required")
         now = datetime.now(timezone.utc)
         cache_service = current_app.extensions.get("cache_service")
@@ -101,7 +137,12 @@ def auth_callback(provider: str):
                 cache_hooks = (
                     cache_service.build_hooks() if cache_service else None
                 )
-                repo = UserRepository(db_session, cache_hooks=cache_hooks)
+                encryptor = current_app.extensions.get("encryptor")
+                repo = UserRepository(
+                    db_session,
+                    cache_hooks=cache_hooks,
+                    encryptor=encryptor,
+                )
                 user = repo.upsert_oauth_user(
                     email=email,
                     provider=provider,
@@ -119,9 +160,26 @@ def auth_callback(provider: str):
                     ),
                 )
                 profile = _serialize_user(user)
+                log_audit_event(
+                    "auth.callback.success",
+                    session=db_session,
+                    user_id=user.id,
+                    actor=email,
+                    details={"provider": provider},
+                )
         except ValueError as exc:
+            log_audit_event(
+                "auth.callback.validation_error",
+                actor=email,
+                details={"provider": provider, "reason": str(exc)},
+            )
             return error_response(422, str(exc))
         except RepositoryError as exc:
+            log_audit_event(
+                "auth.callback.repository_error",
+                actor=email,
+                details={"provider": provider, "message": str(exc)},
+            )
             return repository_error_response(exc)
         if cache_service and cache_service.enabled:
             cache_service.set_json(
@@ -146,11 +204,26 @@ def verify():
     data = request.get_json() or {}
     token = data.get("token")
     if not token:
+        log_audit_event(
+            "auth.verify.missing_token",
+            details={"body": list(data.keys())},
+        )
         return error_response(400, "missing token")
     try:
         payload = decode_jwt(token)
     except Exception as exc:  # pragma: no cover - jwt errors
+        log_audit_event(
+            "auth.verify.invalid",
+            actor=None,
+            details={"reason": str(exc)},
+        )
         return error_response(401, str(exc))
+    log_audit_event(
+        "auth.verify.success",
+        user_id=payload.get("sub"),
+        actor=payload.get("email"),
+        details={"exp": payload.get("exp")},
+    )
     return jsonify(
         {"valid": True, "sub": payload["sub"], "exp": payload["exp"]}
     )
@@ -188,7 +261,12 @@ def request_verification():
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repo = UserRepository(db_session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                db_session,
+                cache_hooks=cache_hooks,
+                encryptor=encryptor,
+            )
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -199,6 +277,18 @@ def request_verification():
                 expires_at=expires_at,
             )
             data = verification_schema.dump(verification)
+            log_audit_event(
+                "auth.verification.request",
+                session=db_session,
+                user_id=user.id,
+                actor=str(user.email),
+                details={
+                    "method": verification.method,
+                    "expires_at": verification.expires_at.isoformat()
+                    if verification.expires_at
+                    else None,
+                },
+            )
     except RepositoryError as exc:
         return repository_error_response(exc)
 
@@ -225,7 +315,10 @@ def confirm_verification():
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repo = UserRepository(db_session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                db_session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
             verification = repo.get_verification_by_id(verification_id)
             if verification is None:
                 return error_response(404, "verification not found")
@@ -235,6 +328,13 @@ def confirm_verification():
                 at=datetime.now(timezone.utc),
             )
             data = verification_schema.dump(verification)
+            log_audit_event(
+                "auth.verification.confirm",
+                session=db_session,
+                user_id=verification.user_id,
+                actor=str(verification.method),
+                details={"success": success},
+            )
     except RepositoryError as exc:
         return repository_error_response(exc)
 
@@ -264,7 +364,10 @@ def profile():
             cache_hooks = (
                 cache_service.build_hooks() if cache_service else None
             )
-            repo = UserRepository(db_session, cache_hooks=cache_hooks)
+            encryptor = current_app.extensions.get("encryptor")
+            repo = UserRepository(
+                db_session, cache_hooks=cache_hooks, encryptor=encryptor
+            )
             user = repo.get(user_id)
             if not user:
                 return error_response(404, "user not found")

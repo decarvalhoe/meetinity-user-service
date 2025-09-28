@@ -17,6 +17,7 @@ T = TypeVar("T")
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from src.services.cache import CacheHooks
+    from src.utils.encryption import ApplicationEncryptor
 
 
 @dataclass(slots=True)
@@ -39,9 +40,11 @@ class SQLAlchemyRepository:
         session: Session,
         *,
         cache_hooks: "CacheHooks | None" = None,
+        encryptor: "ApplicationEncryptor | None" = None,
     ) -> None:
         self.session = session
         self._cache_hooks = cache_hooks
+        self._encryptor = encryptor
 
     # ------------------------------------------------------------------
     # Error handling helpers
