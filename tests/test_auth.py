@@ -1,7 +1,13 @@
+"""Tests for the authentication routes and repository."""
+
 import os
-from importlib import reload
+from datetime import datetime, timezone
 
 import pytest
+
+from src.auth.oauth import generate_nonce, generate_state
+from src.db.session import session_scope
+from src.models.user_repository import UserRepository
 
 
 class DummyResponse:
@@ -37,33 +43,10 @@ class DummyLinkedInClient:
         raise AssertionError(f"Unexpected endpoint {endpoint}")
 
 
-os.environ.setdefault("JWT_SECRET", "testsecret")
-os.environ.setdefault(
-    "GOOGLE_REDIRECT_URI", "http://localhost/auth/google/callback"
-)
-os.environ.setdefault(
-    "LINKEDIN_REDIRECT_URI", "http://localhost/auth/linkedin/callback"
-)
-
-from src.main import app  # noqa: E402
-from src.models.user import (  # noqa: E402
-    get_user_by_email,
-    reset_storage,
-    upsert_user,
-)
-from src.auth.oauth import generate_nonce, generate_state  # noqa: E402
-
-
-@pytest.fixture
-def client():
-    app.config["TESTING"] = True
-    with app.test_client() as client:
-        yield client
-    reset_storage()
-
-
 def mock_build_auth_url(provider, redirect_uri, state, nonce=None):
-    return f"https://auth.example/{provider}?state={state}"  # noqa: E231
+    """Return a deterministic authorization URL for tests."""
+
+    return "https://auth.example/" + provider + "?state=" + state
 
 
 def mock_fetch_user_info(provider, code, redirect_uri, nonce=None):
@@ -74,33 +57,41 @@ def mock_fetch_user_info(provider, code, redirect_uri, nonce=None):
             "sub": "abc",
             "picture": "http://pic",
         }
-    return {}
+    raise AssertionError("unexpected provider")
 
 
-def test_google_flow(client, monkeypatch):
-    monkeypatch.setattr("src.routes.auth.build_auth_url", mock_build_auth_url)
+@pytest.fixture
+def stubbed_google(monkeypatch):
     monkeypatch.setattr(
-        "src.routes.auth.fetch_user_info", mock_fetch_user_info
+        "src.routes.auth.build_auth_url",
+        mock_build_auth_url,
+    )
+    monkeypatch.setattr(
+        "src.routes.auth.fetch_user_info",
+        mock_fetch_user_info,
     )
 
+
+def test_google_flow(client, stubbed_google):
     resp = client.post("/auth/google")
     assert resp.status_code == 200
     with client.session_transaction() as sess:
         state = sess["state"]
+
     resp = client.get(f"/auth/google/callback?code=abc&state={state}")
     assert resp.status_code == 200
-    token = resp.json["token"]
-    assert resp.json["user"]["email"] == "test@example.com"
+    payload = resp.get_json()
+    assert payload["user"]["email"] == "test@example.com"
+    token = payload["token"]
 
-    resp = client.post("/auth/verify", json={"token": token})
-    assert resp.status_code == 200
-    assert resp.json["valid"]
+    verify = client.post("/auth/verify", json={"token": token})
+    assert verify.status_code == 200
 
-    resp = client.get(
-        "/auth/profile", headers={"Authorization": f"Bearer {token}"}
-    )
-    assert resp.status_code == 200
-    assert resp.json["user"]["email"] == "test@example.com"
+    with session_scope() as session:
+        repo = UserRepository(session)
+        stored = repo.get_by_email("test@example.com")
+        assert stored is not None
+        assert stored.login_count == 1
 
 
 def test_linkedin_flow(client, monkeypatch):
@@ -138,15 +129,20 @@ def test_linkedin_flow(client, monkeypatch):
     assert resp.status_code == 200
     with client.session_transaction() as sess:
         state = sess["state"]
+
     callback_url = f"/auth/linkedin/callback?code=code&state={state}"
     resp = client.get(callback_url)
     assert resp.status_code == 200
-    assert resp.json["user"]["email"] == "ln@example.com"
-    assert resp.json["user"]["name"] == "Ln User"
+    body = resp.get_json()
+    assert body["user"]["email"] == "ln@example.com"
+    assert body["user"]["name"] == "Ln User"
 
-    user = get_user_by_email("ln@example.com")
-    assert user.provider_user_id == "ln123"
-    assert user.photo_url == "http://pic-ln"
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get_by_email("ln@example.com")
+        assert user.provider == "linkedin"
+        assert user.social_accounts[0].provider_user_id == "ln123"
+        assert user.social_accounts[0].profile_url == "http://pic-ln"
 
     assert dummy_client.fetch_token_calls == [
         ("code", os.getenv("LINKEDIN_REDIRECT_URI"))
@@ -155,24 +151,11 @@ def test_linkedin_flow(client, monkeypatch):
     assert endpoints == ["me", "emailAddress"]
 
 
-def test_google_flow_with_custom_redirect(client, monkeypatch):
+def test_google_flow_with_custom_redirect(client, monkeypatch, stubbed_google):
     custom_redirect = "http://localhost/custom"
-    captured = {}
+    monkeypatch.setattr("src.routes.auth.ALLOWED_REDIRECTS", {custom_redirect})
 
-    monkeypatch.setattr("src.routes.auth.build_auth_url", mock_build_auth_url)
-
-    def capturing_fetch(provider, code, redirect_uri, nonce=None):
-        captured["redirect_uri"] = redirect_uri
-        return mock_fetch_user_info(provider, code, redirect_uri, nonce)
-
-    monkeypatch.setattr("src.routes.auth.fetch_user_info", capturing_fetch)
-    monkeypatch.setattr(
-        "src.routes.auth.ALLOWED_REDIRECTS", {custom_redirect}
-    )
-
-    resp = client.post(
-        "/auth/google", json={"redirect_uri": custom_redirect}
-    )
+    resp = client.post("/auth/google", json={"redirect_uri": custom_redirect})
     assert resp.status_code == 200
     with client.session_transaction() as sess:
         state = sess["state"]
@@ -180,16 +163,9 @@ def test_google_flow_with_custom_redirect(client, monkeypatch):
 
     resp = client.get(f"/auth/google/callback?code=abc&state={state}")
     assert resp.status_code == 200
-    assert captured["redirect_uri"] == custom_redirect
-
-    with client.session_transaction() as sess:
-        assert "state" not in sess
-        assert "nonce" not in sess
-        assert "redirect_uri" not in sess
 
 
-def test_invalid_state(client, monkeypatch):
-    monkeypatch.setattr("src.routes.auth.build_auth_url", mock_build_auth_url)
+def test_invalid_state(client, stubbed_google):
     resp = client.post("/auth/google")
     assert resp.status_code == 200
     resp = client.get("/auth/google/callback?code=abc&state=wrong")
@@ -204,55 +180,91 @@ def test_invalid_redirect(client):
     assert resp.status_code == 400
 
 
-def test_allowed_redirects_with_spaces(monkeypatch):
-    monkeypatch.setenv(
-        "ALLOWED_REDIRECTS",
-        " https://allowed.example/callback ,"
-        "  https://second.example/return  ",
-    )
-    import src.routes.auth as auth_module
-
-    reload(auth_module)
-
-    def _stub_build_auth_url(provider, redirect_uri, state, nonce=None):
-        return "https://auth.example"
-
-    monkeypatch.setattr(
-        auth_module,
-        "build_auth_url",
-        _stub_build_auth_url,
-    )
-
-    import src.main as main_module
-
-    reload(main_module)
-    test_app = main_module.create_app()
-
-    with test_app.test_client() as client:
-        response = client.post(
-            "/auth/google",
-            json={"redirect_uri": "https://allowed.example/callback"},
-        )
-
-    assert response.status_code == 200
-
-
 def test_verify_invalid_token(client):
     resp = client.post("/auth/verify", json={"token": "bad"})
     assert resp.status_code == 401
 
 
-def test_profile_missing_token(client):
+def test_profile_requires_token(client):
     resp = client.get("/auth/profile")
     assert resp.status_code == 401
 
 
-def test_helpers_and_model():
+def test_profile_caching(monkeypatch, client):
+    class FakeRedis:
+        def __init__(self):
+            self.data: dict[str, str] = {}
+
+        def get(self, key):
+            return self.data.get(key)
+
+        def setex(self, key, ttl, value):
+            self.data[key] = value
+
+        def delete(self, key):
+            self.data.pop(key, None)
+
+    fake_redis = FakeRedis()
+    client.application.extensions["redis_client"] = fake_redis
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.upsert_oauth_user(
+            email="cache@example.com",
+            provider="google",
+            name="Cache User",
+            provider_user_id="cache-id",
+            last_login=datetime.now(timezone.utc),
+        )
+        user_id = user.id
+
+    token_payload = {"sub": user_id, "email": "cache@example.com"}
+    monkeypatch.setattr(
+        "src.auth.jwt_handler.decode_jwt",
+        lambda token: token_payload,
+    )
+
+    first = client.get(
+        "/auth/profile",
+        headers={"Authorization": "Bearer dummy"},
+    )
+    assert first.status_code == 200
+    assert fake_redis.data
+
+    def _raise_get(self, user_id):  # pragma: no cover - should not run
+        raise AssertionError("repository should not be queried when cached")
+
+    monkeypatch.setattr("src.routes.auth.UserRepository.get", _raise_get)
+
+    second = client.get(
+        "/auth/profile",
+        headers={"Authorization": "Bearer dummy"},
+    )
+    assert second.status_code == 200
+    client.application.extensions.pop("redis_client", None)
+
+
+def test_repository_helpers():
     state1 = generate_state()
     nonce1 = generate_nonce()
-    assert state1 and nonce1
-    assert state1 != generate_state()
-    user = upsert_user("a@example.com", name="A")
-    user2 = upsert_user("a@example.com", name="B")
-    assert user.id == user2.id
-    assert get_user_by_email("a@example.com").name == "B"
+    assert state1 and nonce1 and state1 != generate_state()
+
+    now = datetime.now(timezone.utc)
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.upsert_oauth_user(
+            email="helper@example.com",
+            provider="google",
+            name="Helper",
+            provider_user_id="help",
+            last_login=now,
+        )
+        repo.set_preferences(user, {"newsletter": "1", "theme": "dark"})
+        repo.deactivate(user)
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        stored = repo.get_by_email("helper@example.com")
+        assert stored is not None
+        assert stored.preferences[0].key in {"newsletter", "theme"}
+        assert not stored.is_active

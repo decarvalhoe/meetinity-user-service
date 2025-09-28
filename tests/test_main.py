@@ -1,15 +1,6 @@
+"""Smoke tests for the Flask application."""
+
 from datetime import datetime
-
-import pytest
-from src.main import create_app
-
-
-@pytest.fixture
-def client():
-    app = create_app()
-    app.config["TESTING"] = True
-    with app.test_client() as client:
-        yield client
 
 
 def test_health(client):
@@ -17,20 +8,21 @@ def test_health(client):
     assert response.status_code == 200
     data = response.get_json()
     assert data["status"] == "ok"
-    ts = datetime.fromisoformat(data["timestamp"].replace("Z", "+00:00"))
-    assert ts.tzinfo is not None
+    timestamp = datetime.fromisoformat(data["timestamp"])
+    assert timestamp.tzinfo is not None
 
 
-def test_users(client):
+def test_users_endpoint(client):
     response = client.get("/users")
     assert response.status_code == 200
-    assert "users" in response.get_json()
+    assert response.get_json() == {"users": []}
 
 
 def test_not_found(client):
     response = client.get("/missing")
     assert response.status_code == 404
-    assert "error" in response.get_json()
+    payload = response.get_json()
+    assert payload["error"]
 
 
 def test_cors_headers(client):

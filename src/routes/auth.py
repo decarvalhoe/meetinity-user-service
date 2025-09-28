@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Authentication routes for the User Service.
+"""Authentication routes for the User Service."""
 
-This file defines the routes for OAuth authentication, token verification, and user profile retrieval.
-"""
-
+import json
 import os
 from datetime import datetime, timezone
+from typing import Any, Dict
 
-from flask import Blueprint, jsonify, request, session
+from flask import Blueprint, current_app, jsonify, request, session
 
 from src.auth.jwt_handler import decode_jwt, encode_jwt, require_auth
 from src.auth.oauth import (
@@ -16,7 +15,8 @@ from src.auth.oauth import (
     generate_nonce,
     generate_state,
 )
-from src.models.user import get_user, upsert_user
+from src.db.session import session_scope
+from src.models.user_repository import UserRepository
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 
@@ -116,21 +116,38 @@ def auth_callback(provider: str):
         email = info.get("email")
         if not email:
             return _error(422, "email required")
-        user = upsert_user(
-            email=email,
-            name=info.get("name") or info.get("localizedFirstName"),
-            photo_url=info.get("picture") or info.get("profilePicture"),
-            provider=provider,
-            provider_user_id=info.get("sub") or info.get("id"),
-            last_login=datetime.now(timezone.utc),
-        )
+        now = datetime.now(timezone.utc)
+        redis_client = current_app.extensions.get("redis_client")
+        try:
+            with session_scope() as db_session:
+                repo = UserRepository(db_session)
+                user = repo.upsert_oauth_user(
+                    email=email,
+                    provider=provider,
+                    provider_user_id=info.get("sub") or info.get("id"),
+                    name=info.get("name")
+                    or info.get("localizedFirstName"),
+                    photo_url=info.get("picture")
+                    or info.get("profilePicture"),
+                    company=info.get("company"),
+                    title=info.get("title"),
+                    location=info.get("locale") or info.get("location"),
+                    last_login=now,
+                    social_profile_url=(
+                        info.get("profile") or info.get("profilePicture")
+                    ),
+                )
+                profile = _serialize_user(user)
+        except ValueError as exc:
+            return _error(422, str(exc))
+        if redis_client:
+            redis_client.setex(
+                _profile_cache_key(user.id),
+                current_app.config["APP_CONFIG"].redis_cache_ttl,
+                json.dumps(profile),
+            )
         token = encode_jwt(user)
-        return jsonify(
-            {
-                "token": token,
-                "user": {"id": user.id, "email": user.email, "name": user.name},
-            }
-        )
+        return jsonify({"token": token, "user": profile})
     finally:
         session.pop("state", None)
         session.pop("nonce", None)
@@ -166,10 +183,68 @@ def profile():
         Response: A JSON response with the user's profile information.
     """
     user_id = request.user["sub"]
-    user = get_user(user_id)
-    if not user:
-        return _error(404, "user not found")
-    return jsonify(
-        {"user": {"id": user.id, "email": user.email, "name": user.name}}
-    )
+    redis_client = current_app.extensions.get("redis_client")
+    cache_key = _profile_cache_key(user_id)
+    if redis_client:
+        cached = redis_client.get(cache_key)
+        if cached:
+            return jsonify({"user": json.loads(cached)})
 
+    with session_scope() as db_session:
+        repo = UserRepository(db_session)
+        user = repo.get(user_id)
+        if not user:
+            return _error(404, "user not found")
+        profile = _serialize_user(user)
+
+    if redis_client:
+        redis_client.setex(
+            cache_key,
+            current_app.config["APP_CONFIG"].redis_cache_ttl,
+            json.dumps(profile),
+        )
+
+    return jsonify({"user": profile})
+
+
+def _profile_cache_key(user_id: int) -> str:
+    return "user:profile:" + str(user_id)
+
+
+def _serialize_user(user) -> Dict[str, Any]:
+    """Serialize a user object for JSON responses/caching."""
+
+    def _dt_to_iso(dt: datetime | None) -> str | None:
+        return dt.isoformat() if dt else None
+
+    return {
+        "id": user.id,
+        "email": user.email,
+        "name": user.name,
+        "photo_url": user.photo_url,
+        "title": user.title,
+        "company": user.company,
+        "location": user.location,
+        "provider": user.provider,
+        "provider_user_id": user.provider_user_id,
+        "last_login": _dt_to_iso(user.last_login),
+        "last_active_at": _dt_to_iso(user.last_active_at),
+        "bio": user.bio,
+        "timezone": user.timezone,
+        "is_active": user.is_active,
+        "preferences": {
+            pref.key: pref.value for pref in getattr(user, "preferences", [])
+        },
+        "social_accounts": [
+            {
+                "provider": account.provider,
+                "provider_user_id": account.provider_user_id,
+                "display_name": account.display_name,
+                "profile_url": account.profile_url,
+                "last_connected_at": _dt_to_iso(
+                    account.last_connected_at
+                ),
+            }
+            for account in getattr(user, "social_accounts", [])
+        ],
+    }
