@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Mapping, Tuple
+from typing import Callable, Mapping, Tuple, TypeVar
 
-from flask import Blueprint, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request
 from marshmallow import ValidationError
 
-from src.db.session import session_scope
-from src.models.user_repository import UserRepository
+from src.models.repositories import RepositoryError, UserRepository
 from src.routes.auth import _profile_cache_key
-from src.routes.helpers import error_response
+from src.routes.helpers import error_response, repository_error_response
 from src.schemas.user import (
     UserActivitySchema,
     UserConnectionSchema,
@@ -21,6 +20,7 @@ from src.schemas.user import (
     UserUpdateSchema,
 )
 from src.services.uploads import UploadError, save_user_photo
+from src.services.transactions import transactional_session
 from src.utils.lists import normalize_string_list
 
 users_bp = Blueprint("users", __name__, url_prefix="/users")
@@ -46,6 +46,20 @@ ALLOWED_SORT_FIELDS = {
 }
 
 
+T = TypeVar("T")
+
+
+def _execute_user_repo(
+    transaction_name: str, handler: Callable[[UserRepository], T]
+) -> tuple[T | None, Response | tuple | None]:
+    try:
+        with transactional_session(name=transaction_name) as session:
+            repository = UserRepository(session)
+            return handler(repository), None
+    except RepositoryError as exc:
+        return None, repository_error_response(exc)
+
+
 @users_bp.get("")
 def list_users():
     """Return paginated users with optional filters."""
@@ -55,14 +69,18 @@ def list_users():
     except ValueError as exc:
         return error_response(400, str(exc))
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        items, total = repo.list_users(
+    result, error = _execute_user_repo(
+        "users.list",
+        lambda repo: repo.list_users(
             page=page,
             per_page=per_page,
             sort=sort,
             filters=filters,
-        )
+        ),
+    )
+    if error:
+        return error
+    items, total = result
     return jsonify(
         {
             "items": users_schema.dump(items),
@@ -77,12 +95,14 @@ def list_users():
 def get_user(user_id: int):
     """Return a single user profile."""
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        return jsonify({"user": user_schema.dump(user)})
+    user, error = _execute_user_repo(
+        "users.get", lambda repo: repo.get(user_id)
+    )
+    if error:
+        return error
+    if user is None:
+        return error_response(404, "user not found")
+    return jsonify({"user": user_schema.dump(user)})
 
 
 @users_bp.put("/<int:user_id>")
@@ -97,13 +117,16 @@ def update_user(user_id: int):
     except ValidationError as exc:
         return error_response(422, "invalid payload", exc.messages)
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        updated = repo.update_user(user, data)
-        response = jsonify({"user": user_schema.dump(updated)})
+    try:
+        with transactional_session(name="users.update") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            updated = repo.update_user(user, data)
+            response = jsonify({"user": user_schema.dump(updated)})
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
 
@@ -114,12 +137,15 @@ def update_user(user_id: int):
 def delete_user(user_id: int):
     """Delete a user profile."""
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        repo.delete_user(user)
+    try:
+        with transactional_session(name="users.delete") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            repo.delete_user(user)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
 
@@ -143,13 +169,16 @@ def upsert_preferences(user_id: int):
             return error_response(422, "invalid preference key")
         normalized[key.strip()] = None if value is None else str(value)
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        repo.set_preferences(user, normalized)
-        serialized = user_schema.dump(user)
+    try:
+        with transactional_session(name="users.preferences") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            repo.set_preferences(user, normalized)
+            serialized = user_schema.dump(user)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
     return jsonify(
@@ -171,17 +200,20 @@ def update_privacy(user_id: int):
     if active_tokens is not None and not isinstance(active_tokens, list):
         return error_response(422, "active_tokens must be a list")
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        repo.update_privacy(
-            user,
-            privacy_settings=privacy_settings,
-            active_tokens=active_tokens,
-        )
-        serialized = user_schema.dump(user)
+    try:
+        with transactional_session(name="users.privacy") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            repo.update_privacy(
+                user,
+                privacy_settings=privacy_settings,
+                active_tokens=active_tokens,
+            )
+            serialized = user_schema.dump(user)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
     return jsonify({"user": serialized})
@@ -191,17 +223,19 @@ def update_privacy(user_id: int):
 def get_privacy(user_id: int):
     """Return stored privacy metadata for a user."""
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        payload = {
-            "user_id": user_id,
-            "privacy_settings": user.privacy_settings or {},
-            "privacy_level": user.privacy_level,
-            "active_tokens": user.active_tokens or [],
-        }
+    user, error = _execute_user_repo(
+        "users.privacy.get", lambda repo: repo.get(user_id)
+    )
+    if error:
+        return error
+    if user is None:
+        return error_response(404, "user not found")
+    payload = {
+        "user_id": user_id,
+        "privacy_settings": user.privacy_settings or {},
+        "privacy_level": user.privacy_level,
+        "active_tokens": user.active_tokens or [],
+    }
     return jsonify(payload)
 
 
@@ -219,21 +253,24 @@ def verify_user(user_id: int):
     if not isinstance(code, str) or not code.strip():
         return error_response(422, "verification code required")
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        verification = repo.get_verification(user_id, method.strip())
-        if verification is None:
-            return error_response(404, "verification not found")
-        success = repo.confirm_verification(
-            verification,
-            provided_code=code.strip(),
-        )
-        verification_payload = verification_schema.dump(verification)
-        user_payload = user_schema.dump(user)
-        status = verification.status
+    try:
+        with transactional_session(name="users.verify") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            verification = repo.get_verification(user_id, method.strip())
+            if verification is None:
+                return error_response(404, "verification not found")
+            success = repo.confirm_verification(
+                verification,
+                provided_code=code.strip(),
+            )
+            verification_payload = verification_schema.dump(verification)
+            user_payload = user_schema.dump(user)
+            status = verification.status
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     if success:
         _invalidate_profile_cache(user_id)
@@ -275,13 +312,16 @@ def deactivate_user(user_id: int):
         except ValueError as exc:
             return error_response(422, str(exc))
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        updated = repo.deactivate(user, reactivation_at=reactivation_at)
-        user_payload = user_schema.dump(updated)
+    try:
+        with transactional_session(name="users.deactivate") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            updated = repo.deactivate(user, reactivation_at=reactivation_at)
+            user_payload = user_schema.dump(updated)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
     response = jsonify(
@@ -311,23 +351,26 @@ def upload_photo(user_id: int):
         "/uploads",
     )
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        try:
-            photo_url = save_user_photo(
-                file,
-                user_id=user.id,
-                upload_folder=upload_folder,
-                url_prefix=url_prefix,
-            )
-        except UploadError as exc:
-            return error_response(422, str(exc))
-        repo.set_photo_url(user, photo_url)
-        response = jsonify({"photo_url": photo_url, "user_id": user.id})
-        response.status_code = 201
+    try:
+        with transactional_session(name="users.photo") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            try:
+                photo_url = save_user_photo(
+                    file,
+                    user_id=user.id,
+                    upload_folder=upload_folder,
+                    url_prefix=url_prefix,
+                )
+            except UploadError as exc:
+                return error_response(422, str(exc))
+            repo.set_photo_url(user, photo_url)
+            response = jsonify({"photo_url": photo_url, "user_id": user.id})
+            response.status_code = 201
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     redis_client = current_app.extensions.get("redis_client")
     if redis_client:
@@ -353,19 +396,22 @@ def log_activity(user_id: int):
     except (TypeError, ValueError):
         return error_response(422, "score_delta must be an integer")
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        activity = repo.record_activity(
-            user,
-            activity_type=activity_type.strip(),
-            description=description,
-            score_delta=score_delta_int,
-        )
-        response = jsonify({"activity": activity_schema.dump(activity)})
-        response.status_code = 201
+    try:
+        with transactional_session(name="users.activity") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            activity = repo.record_activity(
+                user,
+                activity_type=activity_type.strip(),
+                description=description,
+                score_delta=score_delta_int,
+            )
+            response = jsonify({"activity": activity_schema.dump(activity)})
+            response.status_code = 201
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
     return response
@@ -385,12 +431,15 @@ def list_activities(user_id: int):
     except ValueError as exc:
         return error_response(400, str(exc))
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        activities = repo.list_activities(user, limit=limit)
+    try:
+        with transactional_session(name="users.activities.list") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            activities = repo.list_activities(user, limit=limit)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
     return jsonify(
         {"items": activities_schema.dump(activities), "total": len(activities)}
     )
@@ -415,9 +464,9 @@ def search_users():
     except ValueError as exc:
         return error_response(400, str(exc))
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        items, total, recommendations = repo.search_users(
+    result, error = _execute_user_repo(
+        "users.search",
+        lambda repo: repo.search_users(
             query=query,
             page=page,
             per_page=per_page,
@@ -425,7 +474,11 @@ def search_users():
             filters=filters,
             include_recommendations=True,
             recommendation_limit=recommendation_limit or 5,
-        )
+        ),
+    )
+    if error:
+        return error
+    items, total, recommendations = result
     return jsonify(
         {
             "items": users_schema.dump(items),
@@ -457,28 +510,31 @@ def discover_users():
         return error_response(400, str(exc))
 
     base_user_id = request.args.get("user_id")
-    with session_scope() as session:
-        repo = UserRepository(session)
-        base_user = None
-        if base_user_id:
-            try:
-                parsed_id = int(base_user_id)
-            except (TypeError, ValueError):
-                return error_response(400, "invalid user_id")
-            base_user = repo.get(parsed_id)
-            if base_user is None:
-                return error_response(404, "user not found")
-        items, total, recommendations = repo.search_users(
-            query=query,
-            page=page,
-            per_page=per_page,
-            sort=sort,
-            filters=filters,
-            include_recommendations=True,
-            base_user=base_user,
-            recommendation_limit=recommendation_limit or 6,
-        )
-        context_user_id = base_user.id if base_user else None
+    try:
+        with transactional_session(name="users.discover") as session:
+            repo = UserRepository(session)
+            base_user = None
+            if base_user_id:
+                try:
+                    parsed_id = int(base_user_id)
+                except (TypeError, ValueError):
+                    return error_response(400, "invalid user_id")
+                base_user = repo.get(parsed_id)
+                if base_user is None:
+                    return error_response(404, "user not found")
+            items, total, recommendations = repo.search_users(
+                query=query,
+                page=page,
+                per_page=per_page,
+                sort=sort,
+                filters=filters,
+                include_recommendations=True,
+                base_user=base_user,
+                recommendation_limit=recommendation_limit or 6,
+            )
+            context_user_id = base_user.id if base_user else None
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     return jsonify(
         {
@@ -512,21 +568,24 @@ def create_session(user_id: int):
         except ValueError as exc:
             return error_response(422, str(exc))
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        record = repo.create_session(
-            user,
-            session_token=session_token.strip(),
-            encrypted_payload=payload.get("encrypted_payload"),
-            ip_address=payload.get("ip_address"),
-            user_agent=payload.get("user_agent"),
-            expires_at=expires_at,
-        )
-        response = jsonify({"session": session_schema.dump(record)})
-        response.status_code = 201
+    try:
+        with transactional_session(name="users.sessions.create") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            record = repo.create_session(
+                user,
+                session_token=session_token.strip(),
+                encrypted_payload=payload.get("encrypted_payload"),
+                ip_address=payload.get("ip_address"),
+                user_agent=payload.get("user_agent"),
+                expires_at=expires_at,
+            )
+            response = jsonify({"session": session_schema.dump(record)})
+            response.status_code = 201
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
     return response
@@ -536,12 +595,15 @@ def create_session(user_id: int):
 def list_sessions(user_id: int):
     """List encrypted sessions for a user."""
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        records = repo.list_sessions(user)
+    try:
+        with transactional_session(name="users.sessions.list") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            records = repo.list_sessions(user)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
     return jsonify(
         {"items": sessions_schema.dump(records), "total": len(records)}
     )
@@ -551,12 +613,15 @@ def list_sessions(user_id: int):
 def revoke_session(user_id: int, session_id: int):
     """Revoke a session token."""
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        record = repo.get_session_by_id(session_id)
-        if record is None or record.user_id != user_id:
-            return error_response(404, "session not found")
-        repo.revoke_session(record)
+    try:
+        with transactional_session(name="users.sessions.revoke") as session:
+            repo = UserRepository(session)
+            record = repo.get_session_by_id(session_id)
+            if record is None or record.user_id != user_id:
+                return error_response(404, "session not found")
+            repo.revoke_session(record)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
     return "", 204
@@ -576,21 +641,26 @@ def create_connection(user_id: int):
     if attributes is not None and not isinstance(attributes, dict):
         return error_response(422, "attributes must be an object")
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        connection = repo.create_connection(
-            user,
-            connection_type=connection_type.strip(),
-            status=payload.get("status", "pending"),
-            target_user_id=payload.get("target_user_id"),
-            external_reference=payload.get("external_reference"),
-            attributes=attributes,
-        )
-        response = jsonify({"connection": connection_schema.dump(connection)})
-        response.status_code = 201
+    try:
+        with transactional_session(name="users.connections.create") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            connection = repo.create_connection(
+                user,
+                connection_type=connection_type.strip(),
+                status=payload.get("status", "pending"),
+                target_user_id=payload.get("target_user_id"),
+                external_reference=payload.get("external_reference"),
+                attributes=attributes,
+            )
+            response = jsonify(
+                {"connection": connection_schema.dump(connection)}
+            )
+            response.status_code = 201
+    except RepositoryError as exc:
+        return repository_error_response(exc)
     _invalidate_profile_cache(user_id)
     return response
 
@@ -600,12 +670,15 @@ def list_connections(user_id: int):
     """List social connections for a user."""
 
     status = request.args.get("status")
-    with session_scope() as session:
-        repo = UserRepository(session)
-        user = repo.get(user_id)
-        if user is None:
-            return error_response(404, "user not found")
-        connections = repo.list_connections(user, status=status or None)
+    try:
+        with transactional_session(name="users.connections.list") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            connections = repo.list_connections(user, status=status or None)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
     return jsonify(
         {
             "items": connections_schema.dump(connections),
@@ -630,17 +703,20 @@ def update_connection(user_id: int, connection_id: int):
     if attributes is not None and not isinstance(attributes, dict):
         return error_response(422, "attributes must be an object")
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        connection = repo.get_connection_by_id(connection_id)
-        if connection is None or connection.user_id != user_id:
-            return error_response(404, "connection not found")
-        updated = repo.update_connection_status(
-            connection,
-            status=status or connection.status,
-            attributes=attributes,
-        )
-        result = connection_schema.dump(updated)
+    try:
+        with transactional_session(name="users.connections.update") as session:
+            repo = UserRepository(session)
+            connection = repo.get_connection_by_id(connection_id)
+            if connection is None or connection.user_id != user_id:
+                return error_response(404, "connection not found")
+            updated = repo.update_connection_status(
+                connection,
+                status=status or connection.status,
+                attributes=attributes,
+            )
+            result = connection_schema.dump(updated)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
 
     _invalidate_profile_cache(user_id)
     return jsonify({"connection": result})
@@ -650,12 +726,15 @@ def update_connection(user_id: int, connection_id: int):
 def delete_connection(user_id: int, connection_id: int):
     """Remove a connection."""
 
-    with session_scope() as session:
-        repo = UserRepository(session)
-        connection = repo.get_connection_by_id(connection_id)
-        if connection is None or connection.user_id != user_id:
-            return error_response(404, "connection not found")
-        repo.delete_connection(connection)
+    try:
+        with transactional_session(name="users.connections.delete") as session:
+            repo = UserRepository(session)
+            connection = repo.get_connection_by_id(connection_id)
+            if connection is None or connection.user_id != user_id:
+                return error_response(404, "connection not found")
+            repo.delete_connection(connection)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
     _invalidate_profile_cache(user_id)
     return "", 204
 

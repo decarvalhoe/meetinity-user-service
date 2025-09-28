@@ -52,6 +52,7 @@ Le Service Utilisateur est un microservice complet d'authentification et de gest
 pip install -r requirements.txt
 alembic upgrade head  # appliquer les migrations
 flake8 src tests
+pytest tests/test_users.py tests/test_auth.py
 pytest --cov=src --cov=tests --cov-report=term-missing --cov-fail-under=90
 ```
 

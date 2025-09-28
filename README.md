@@ -58,6 +58,7 @@ The User Service is a comprehensive authentication and user management microserv
 pip install -r requirements.txt
 alembic upgrade head  # apply DB migrations
 flake8 src tests
+pytest tests/test_users.py tests/test_auth.py
 pytest
 pytest --cov=src --cov=tests --cov-report=term-missing --cov-fail-under=90
 ```
