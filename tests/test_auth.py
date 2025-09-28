@@ -1,7 +1,7 @@
 """Tests for the authentication routes and repository."""
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -268,3 +268,56 @@ def test_repository_helpers():
         assert stored is not None
         assert stored.preferences[0].key in {"newsletter", "theme"}
         assert not stored.is_active
+
+
+def test_verification_request_and_confirm(client):
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.create_user(email="verify@example.com")
+        user_id = user.id
+
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(minutes=5)
+    ).isoformat()
+    request_resp = client.post(
+        "/auth/verification/request",
+        json={
+            "user_id": user_id,
+            "method": "email",
+            "code": "123456",
+            "expires_at": expires_at,
+        },
+    )
+    assert request_resp.status_code == 201
+    verification_id = request_resp.get_json()["verification"]["id"]
+
+    confirm_resp = client.post(
+        "/auth/verification/confirm",
+        json={"verification_id": verification_id, "code": "123456"},
+    )
+    assert confirm_resp.status_code == 200
+    payload = confirm_resp.get_json()
+    assert payload["success"] is True
+    assert payload["verification"]["status"] == "verified"
+
+
+def test_verification_rejects_wrong_code(client):
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.create_user(email="wrong@example.com")
+        user_id = user.id
+
+    request_resp = client.post(
+        "/auth/verification/request",
+        json={"user_id": user_id, "method": "email", "code": "222"},
+    )
+    assert request_resp.status_code == 201
+    verification_id = request_resp.get_json()["verification"]["id"]
+
+    confirm_resp = client.post(
+        "/auth/verification/confirm",
+        json={"verification_id": verification_id, "code": "999"},
+    )
+    assert confirm_resp.status_code == 422
+    payload = confirm_resp.get_json()
+    assert payload["success"] is False
