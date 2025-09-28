@@ -10,6 +10,23 @@ import pytest
 
 from src.db.session import session_scope
 from src.models.user_repository import UserRepository
+from src.routes.auth import _profile_cache_key
+
+
+class DummyRedis:
+    """Minimal Redis-like interface for testing cache invalidation."""
+
+    def __init__(self):
+        self.store: dict[str, object] = {}
+
+    def get(self, key: str):
+        return self.store.get(key)
+
+    def setex(self, key: str, ttl: int, value: object):
+        self.store[key] = value
+
+    def delete(self, key: str):
+        self.store.pop(key, None)
 
 
 @pytest.fixture
@@ -92,6 +109,29 @@ def test_update_user(client, seeded_users):
         stored = repo.get(alice_id)
         assert stored.title == "Senior Engineer"
         assert stored.linkedin_url == "https://linkedin.com/in/alice"
+
+
+def test_update_user_clears_cached_profile(client, seeded_users):
+    alice_id = seeded_users["alice"].id
+    fake_cache = DummyRedis()
+    app = client.application
+    previous_cache = app.extensions.get("redis_client")
+    app.extensions["redis_client"] = fake_cache
+    cache_key = _profile_cache_key(alice_id)
+    fake_cache.setex(cache_key, 60, {"name": "Old Alice"})
+
+    try:
+        response = client.put(
+            f"/users/{alice_id}",
+            json={"title": "Principal Engineer"},
+        )
+        assert response.status_code == 200
+        assert cache_key not in fake_cache.store
+    finally:
+        if previous_cache is not None:
+            app.extensions["redis_client"] = previous_cache
+        else:
+            app.extensions.pop("redis_client", None)
 
 
 def test_delete_user(client, seeded_users):
