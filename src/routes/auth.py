@@ -17,6 +17,7 @@ from src.auth.oauth import (
 )
 from src.db.session import session_scope
 from src.models.user_repository import UserRepository
+from src.routes.helpers import error_response
 from src.schemas.user import UserSchema
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
@@ -27,31 +28,6 @@ ALLOWED_REDIRECTS = {
     for value in os.getenv("ALLOWED_REDIRECTS", "").split(",")
     if value.strip()
 }
-
-
-def _error(code: int, message: str, details: dict | None = None):
-    """Create a standardized error response.
-
-    Args:
-        code (int): The HTTP status code.
-        message (str): The error message.
-        details (dict, optional): Additional error details. Defaults to None.
-
-    Returns:
-        Response: A JSON response with the error details.
-    """
-    return (
-        jsonify(
-            {
-                "error": {
-                    "code": code,
-                    "message": message,
-                    "details": details or {},
-                }
-            }
-        ),
-        code,
-    )
 
 
 @auth_bp.post("/<provider>")
@@ -65,7 +41,7 @@ def auth_start(provider: str):
         Response: A JSON response with the authentication URL.
     """
     if provider not in {"google", "linkedin"}:
-        return _error(400, "bad provider")
+        return error_response(400, "bad provider")
     data = request.get_json(silent=True) or {}
     default_redirect_uri = os.getenv(f"{provider.upper()}_REDIRECT_URI")
     requested_redirect = data.get("redirect_uri")
@@ -75,7 +51,7 @@ def auth_start(provider: str):
             requested_redirect not in ALLOWED_REDIRECTS
             and requested_redirect != default_redirect_uri
         ):
-            return _error(400, "invalid redirect")
+            return error_response(400, "invalid redirect")
         session["redirect_uri"] = requested_redirect
     else:
         session.pop("redirect_uri", None)
@@ -99,14 +75,14 @@ def auth_callback(provider: str):
         Response: A JSON response with the JWT and user information.
     """
     if provider not in {"google", "linkedin"}:
-        return _error(400, "bad provider")
+        return error_response(400, "bad provider")
     try:
         code = request.args.get("code")
         state = request.args.get("state")
         if not code or not state:
-            return _error(400, "missing code or state")
+            return error_response(400, "missing code or state")
         if state != session.get("state"):
-            return _error(401, "invalid state")
+            return error_response(401, "invalid state")
         nonce = session.get("nonce")
         redirect_uri = session.get("redirect_uri") or os.getenv(
             f"{provider.upper()}_REDIRECT_URI"
@@ -114,10 +90,10 @@ def auth_callback(provider: str):
         try:
             info = fetch_user_info(provider, code, redirect_uri, nonce)
         except Exception as exc:  # pragma: no cover - network failures
-            return _error(401, "oauth error", {"reason": str(exc)})
+            return error_response(401, "oauth error", {"reason": str(exc)})
         email = info.get("email")
         if not email:
-            return _error(422, "email required")
+            return error_response(422, "email required")
         now = datetime.now(timezone.utc)
         redis_client = current_app.extensions.get("redis_client")
         try:
@@ -141,7 +117,7 @@ def auth_callback(provider: str):
                 )
                 profile = _serialize_user(user)
         except ValueError as exc:
-            return _error(422, str(exc))
+            return error_response(422, str(exc))
         if redis_client:
             redis_client.setex(
                 _profile_cache_key(user.id),
@@ -166,11 +142,11 @@ def verify():
     data = request.get_json() or {}
     token = data.get("token")
     if not token:
-        return _error(400, "missing token")
+        return error_response(400, "missing token")
     try:
         payload = decode_jwt(token)
     except Exception as exc:  # pragma: no cover - jwt errors
-        return _error(401, str(exc))
+        return error_response(401, str(exc))
     return jsonify(
         {"valid": True, "sub": payload["sub"], "exp": payload["exp"]}
     )
@@ -196,7 +172,7 @@ def profile():
         repo = UserRepository(db_session)
         user = repo.get(user_id)
         if not user:
-            return _error(404, "user not found")
+            return error_response(404, "user not found")
         profile = _serialize_user(user)
 
     if redis_client:

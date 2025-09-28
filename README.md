@@ -48,6 +48,8 @@ The User Service is a comprehensive authentication and user management microserv
 - `REDIS_CACHE_TTL`: cache expiration (seconds) for Redis entries. Defaults to `300`.
 - `ALLOWED_REDIRECTS`: optional comma-separated list of additional redirect URIs for OAuth flows.
 - `JWT_SECRET` (`JWT_ALGO`, `JWT_TTL_MIN`): configuration for signing JSON Web Tokens.
+- `UPLOAD_FOLDER`: directory used to persist uploaded profile photos. Defaults to `instance/uploads`.
+- `UPLOAD_URL_PREFIX`: URL prefix returned for stored profile photos. Defaults to `/uploads`.
 - All timestamps are returned in ISO 8601 format with UTC timezone.
 
 ## Development
@@ -105,6 +107,12 @@ export REDIS_URL="redis://localhost:6379/0"
 - `GET /auth/<provider>/callback?code=..&state=..` → `{ "token": "<jwt>", "user": {...} }`
 - `POST /auth/verify` → `{ "valid": true, "sub": "<user_id>", "exp": 123 }`
 - `GET /auth/profile` (Bearer token) → `{ "user": {...} }`
+- `GET /users` → `{ "items": [User], "page": 1, "per_page": 20, "total": 0 }` with filters `industry`, `location`, `min_experience`, `max_experience`, `skills` and `sort`.
+- `GET /users/<id>` → `{ "user": User }`
+- `PUT /users/<id>` → `{ "user": User }` (update profile fields, skills, interests, status).
+- `DELETE /users/<id>` → `204 No Content`.
+- `POST /users/<id>/photo` → `{ "photo_url": "/uploads/...", "user_id": <id> }` (multipart form field `photo`).
+- `GET /users/search?q=...` → `{ "items": [...], "total": N, "query": "..." }` with pagination & filters.
 - `GET /health`
 
 ## Architecture
