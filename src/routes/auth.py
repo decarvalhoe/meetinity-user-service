@@ -18,10 +18,11 @@ from src.auth.oauth import (
 from src.db.session import session_scope
 from src.models.user_repository import UserRepository
 from src.routes.helpers import error_response
-from src.schemas.user import UserSchema
+from src.schemas.user import UserSchema, UserVerificationSchema
 
 auth_bp = Blueprint("auth", __name__, url_prefix="/auth")
 user_schema = UserSchema()
+verification_schema = UserVerificationSchema()
 
 ALLOWED_REDIRECTS = {
     value.strip()
@@ -152,6 +153,74 @@ def verify():
     )
 
 
+@auth_bp.post("/verification/request")
+def request_verification():
+    """Create or refresh a verification challenge for a user."""
+
+    payload = request.get_json(silent=True) or {}
+    user_id = payload.get("user_id")
+    method = payload.get("method")
+    code = payload.get("code")
+    expires_at_raw = payload.get("expires_at")
+
+    if not isinstance(user_id, int):
+        return error_response(422, "user_id must be an integer")
+    if not isinstance(method, str) or not method.strip():
+        return error_response(422, "method required")
+    if not isinstance(code, str) or not code.strip():
+        return error_response(422, "code required")
+
+    expires_at = None
+    if expires_at_raw is not None:
+        try:
+            expires_at = _parse_iso_datetime(str(expires_at_raw))
+        except ValueError as exc:
+            return error_response(422, str(exc))
+
+    with session_scope() as db_session:
+        repo = UserRepository(db_session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        verification = repo.create_verification(
+            user,
+            method=method.strip(),
+            code=code.strip(),
+            expires_at=expires_at,
+        )
+        data = verification_schema.dump(verification)
+
+    return jsonify({"verification": data}), 201
+
+
+@auth_bp.post("/verification/confirm")
+def confirm_verification():
+    """Validate a verification challenge."""
+
+    payload = request.get_json(silent=True) or {}
+    verification_id = payload.get("verification_id")
+    code = payload.get("code")
+    if not isinstance(verification_id, int):
+        return error_response(422, "verification_id must be an integer")
+    if not isinstance(code, str) or not code.strip():
+        return error_response(422, "code required")
+
+    with session_scope() as db_session:
+        repo = UserRepository(db_session)
+        verification = repo.get_verification_by_id(verification_id)
+        if verification is None:
+            return error_response(404, "verification not found")
+        success = repo.confirm_verification(
+            verification,
+            provided_code=code.strip(),
+            at=datetime.now(timezone.utc),
+        )
+        data = verification_schema.dump(verification)
+
+    status = 200 if success else 422
+    return jsonify({"success": success, "verification": data}), status
+
+
 @auth_bp.get("/profile")
 @require_auth
 def profile():
@@ -193,3 +262,11 @@ def _serialize_user(user) -> Dict[str, Any]:
     """Serialize a user object for JSON responses/caching."""
 
     return user_schema.dump(user)
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        # pragma: no cover - fallback for unsupported formats
+        raise ValueError("invalid datetime format") from exc
