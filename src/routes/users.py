@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Mapping, Tuple
 
 from flask import Blueprint, current_app, jsonify, request
@@ -11,7 +12,13 @@ from src.db.session import session_scope
 from src.models.user_repository import UserRepository
 from src.routes.auth import _profile_cache_key
 from src.routes.helpers import error_response
-from src.schemas.user import UserSchema, UserUpdateSchema
+from src.schemas.user import (
+    UserActivitySchema,
+    UserConnectionSchema,
+    UserSchema,
+    UserSessionSchema,
+    UserUpdateSchema,
+)
 from src.services.uploads import UploadError, save_user_photo
 from src.utils.lists import normalize_string_list
 
@@ -20,6 +27,12 @@ users_bp = Blueprint("users", __name__, url_prefix="/users")
 user_schema = UserSchema()
 users_schema = UserSchema(many=True)
 update_schema = UserUpdateSchema()
+activity_schema = UserActivitySchema()
+activities_schema = UserActivitySchema(many=True)
+session_schema = UserSessionSchema()
+sessions_schema = UserSessionSchema(many=True)
+connection_schema = UserConnectionSchema()
+connections_schema = UserConnectionSchema(many=True)
 
 DEFAULT_SORT = ("created_at", "desc")
 ALLOWED_SORT_FIELDS = {
@@ -90,9 +103,7 @@ def update_user(user_id: int):
         updated = repo.update_user(user, data)
         response = jsonify({"user": user_schema.dump(updated)})
 
-    redis_client = current_app.extensions.get("redis_client")
-    if redis_client:
-        redis_client.delete(_profile_cache_key(user_id))
+    _invalidate_profile_cache(user_id)
 
     return response
 
@@ -108,11 +119,70 @@ def delete_user(user_id: int):
             return error_response(404, "user not found")
         repo.delete_user(user)
 
-    redis_client = current_app.extensions.get("redis_client")
-    if redis_client:
-        redis_client.delete(_profile_cache_key(user_id))
+    _invalidate_profile_cache(user_id)
 
     return "", 204
+
+
+@users_bp.put("/<int:user_id>/preferences")
+def upsert_preferences(user_id: int):
+    """Replace preferences for a user."""
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict) or "preferences" not in payload:
+        return error_response(400, "preferences payload required")
+    preferences = payload["preferences"]
+    if not isinstance(preferences, dict):
+        return error_response(400, "preferences must be an object")
+
+    normalized: dict[str, str | None] = {}
+    for key, value in preferences.items():
+        if not isinstance(key, str) or not key.strip():
+            return error_response(422, "invalid preference key")
+        normalized[key.strip()] = None if value is None else str(value)
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        repo.set_preferences(user, normalized)
+        serialized = user_schema.dump(user)
+
+    _invalidate_profile_cache(user_id)
+    return jsonify(
+        {"preferences": serialized["preferences"], "user_id": user_id}
+    )
+
+
+@users_bp.put("/<int:user_id>/privacy")
+def update_privacy(user_id: int):
+    """Persist privacy settings and active tokens."""
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response(400, "missing request body")
+    privacy_settings = payload.get("privacy_settings")
+    if privacy_settings is not None and not isinstance(privacy_settings, dict):
+        return error_response(422, "privacy_settings must be an object")
+    active_tokens = payload.get("active_tokens")
+    if active_tokens is not None and not isinstance(active_tokens, list):
+        return error_response(422, "active_tokens must be a list")
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        repo.update_privacy(
+            user,
+            privacy_settings=privacy_settings,
+            active_tokens=active_tokens,
+        )
+        serialized = user_schema.dump(user)
+
+    _invalidate_profile_cache(user_id)
+    return jsonify({"user": serialized})
 
 
 @users_bp.post("/<int:user_id>/photo")
@@ -156,6 +226,66 @@ def upload_photo(user_id: int):
     return response
 
 
+@users_bp.post("/<int:user_id>/activities")
+def log_activity(user_id: int):
+    """Record a user activity entry."""
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response(400, "missing request body")
+    activity_type = payload.get("activity_type")
+    if not isinstance(activity_type, str) or not activity_type.strip():
+        return error_response(422, "activity_type required")
+    description = payload.get("description")
+    score_delta = payload.get("score_delta", 0)
+    try:
+        score_delta_int = int(score_delta)
+    except (TypeError, ValueError):
+        return error_response(422, "score_delta must be an integer")
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        activity = repo.record_activity(
+            user,
+            activity_type=activity_type.strip(),
+            description=description,
+            score_delta=score_delta_int,
+        )
+        response = jsonify({"activity": activity_schema.dump(activity)})
+        response.status_code = 201
+
+    _invalidate_profile_cache(user_id)
+    return response
+
+
+@users_bp.get("/<int:user_id>/activities")
+def list_activities(user_id: int):
+    """List recent activities for a user."""
+
+    try:
+        limit = _parse_int(
+            request.args.get("limit"),
+            default=50,
+            min_value=1,
+            max_value=200,
+        )
+    except ValueError as exc:
+        return error_response(400, str(exc))
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        activities = repo.list_activities(user, limit=limit)
+    return jsonify(
+        {"items": activities_schema.dump(activities), "total": len(activities)}
+    )
+
+
 @users_bp.get("/search")
 def search_users():
     """Search users by free text with optional filters."""
@@ -187,6 +317,172 @@ def search_users():
             "query": query,
         }
     )
+
+
+@users_bp.post("/<int:user_id>/sessions")
+def create_session(user_id: int):
+    """Create an encrypted session for a user."""
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response(400, "missing request body")
+    session_token = payload.get("session_token")
+    if not isinstance(session_token, str) or not session_token.strip():
+        return error_response(422, "session_token required")
+    expires_at_raw = payload.get("expires_at")
+    expires_at = None
+    if expires_at_raw is not None:
+        try:
+            expires_at = _parse_iso_datetime(str(expires_at_raw))
+        except ValueError as exc:
+            return error_response(422, str(exc))
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        record = repo.create_session(
+            user,
+            session_token=session_token.strip(),
+            encrypted_payload=payload.get("encrypted_payload"),
+            ip_address=payload.get("ip_address"),
+            user_agent=payload.get("user_agent"),
+            expires_at=expires_at,
+        )
+        response = jsonify({"session": session_schema.dump(record)})
+        response.status_code = 201
+
+    _invalidate_profile_cache(user_id)
+    return response
+
+
+@users_bp.get("/<int:user_id>/sessions")
+def list_sessions(user_id: int):
+    """List encrypted sessions for a user."""
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        records = repo.list_sessions(user)
+    return jsonify(
+        {"items": sessions_schema.dump(records), "total": len(records)}
+    )
+
+
+@users_bp.delete("/<int:user_id>/sessions/<int:session_id>")
+def revoke_session(user_id: int, session_id: int):
+    """Revoke a session token."""
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        record = repo.get_session_by_id(session_id)
+        if record is None or record.user_id != user_id:
+            return error_response(404, "session not found")
+        repo.revoke_session(record)
+
+    _invalidate_profile_cache(user_id)
+    return "", 204
+
+
+@users_bp.post("/<int:user_id>/connections")
+def create_connection(user_id: int):
+    """Create an extended social connection."""
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response(400, "missing request body")
+    connection_type = payload.get("connection_type")
+    if not isinstance(connection_type, str) or not connection_type.strip():
+        return error_response(422, "connection_type required")
+    attributes = payload.get("attributes")
+    if attributes is not None and not isinstance(attributes, dict):
+        return error_response(422, "attributes must be an object")
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        connection = repo.create_connection(
+            user,
+            connection_type=connection_type.strip(),
+            status=payload.get("status", "pending"),
+            target_user_id=payload.get("target_user_id"),
+            external_reference=payload.get("external_reference"),
+            attributes=attributes,
+        )
+        response = jsonify({"connection": connection_schema.dump(connection)})
+        response.status_code = 201
+    _invalidate_profile_cache(user_id)
+    return response
+
+
+@users_bp.get("/<int:user_id>/connections")
+def list_connections(user_id: int):
+    """List social connections for a user."""
+
+    status = request.args.get("status")
+    with session_scope() as session:
+        repo = UserRepository(session)
+        user = repo.get(user_id)
+        if user is None:
+            return error_response(404, "user not found")
+        connections = repo.list_connections(user, status=status or None)
+    return jsonify(
+        {
+            "items": connections_schema.dump(connections),
+            "total": len(connections),
+        }
+    )
+
+
+@users_bp.patch("/<int:user_id>/connections/<int:connection_id>")
+def update_connection(user_id: int, connection_id: int):
+    """Update connection status or metadata."""
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response(400, "missing request body")
+    status = payload.get("status")
+    if status is not None and (
+        not isinstance(status, str) or not status.strip()
+    ):
+        return error_response(422, "invalid status")
+    attributes = payload.get("attributes")
+    if attributes is not None and not isinstance(attributes, dict):
+        return error_response(422, "attributes must be an object")
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        connection = repo.get_connection_by_id(connection_id)
+        if connection is None or connection.user_id != user_id:
+            return error_response(404, "connection not found")
+        updated = repo.update_connection_status(
+            connection,
+            status=status or connection.status,
+            attributes=attributes,
+        )
+        result = connection_schema.dump(updated)
+
+    _invalidate_profile_cache(user_id)
+    return jsonify({"connection": result})
+
+
+@users_bp.delete("/<int:user_id>/connections/<int:connection_id>")
+def delete_connection(user_id: int, connection_id: int):
+    """Remove a connection."""
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        connection = repo.get_connection_by_id(connection_id)
+        if connection is None or connection.user_id != user_id:
+            return error_response(404, "connection not found")
+        repo.delete_connection(connection)
+    _invalidate_profile_cache(user_id)
+    return "", 204
 
 
 def _parse_listing_args(
@@ -264,3 +560,16 @@ def _parse_sort(sort_value: str | None) -> Tuple[str, str]:
     if direction not in {"asc", "desc"}:
         raise ValueError("invalid sort direction")
     return field, direction
+
+
+def _parse_iso_datetime(value: str) -> datetime:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:  # pragma: no cover - python <3.11 compatibility
+        raise ValueError("invalid datetime format") from exc
+
+
+def _invalidate_profile_cache(user_id: int) -> None:
+    redis_client = current_app.extensions.get("redis_client")
+    if redis_client:
+        redis_client.delete(_profile_cache_key(user_id))

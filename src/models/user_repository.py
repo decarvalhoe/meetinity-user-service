@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Iterable, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
-from src.models.user import User, UserPreference, UserSocialAccount
+from src.models.user import (
+    User,
+    UserActivity,
+    UserConnection,
+    UserPreference,
+    UserSession,
+    UserSocialAccount,
+    UserVerification,
+)
 from src.utils.lists import encode_string_list
 
 
@@ -153,6 +161,8 @@ class UserRepository:
             "bio": "bio",
             "timezone": "timezone",
             "is_active": "is_active",
+            "engagement_score": "engagement_score",
+            "reputation_score": "reputation_score",
         }
         for field, attr in mapping.items():
             if field in data:
@@ -162,6 +172,10 @@ class UserRepository:
             user.skills = encode_string_list(data.get("skills"))
         if "interests" in data:
             user.interests = encode_string_list(data.get("interests"))
+        if "privacy_settings" in data and data["privacy_settings"] is not None:
+            user.privacy_settings = dict(data["privacy_settings"])
+        if "active_tokens" in data and data["active_tokens"] is not None:
+            user.active_tokens = self._normalize_tokens(data["active_tokens"])
 
         self.session.flush()
         return user
@@ -249,6 +263,246 @@ class UserRepository:
         self.session.flush()
 
     # ------------------------------------------------------------------
+    # Extended aggregates
+    # ------------------------------------------------------------------
+    def update_privacy(
+        self,
+        user: User,
+        *,
+        privacy_settings: Optional[dict[str, object]] = None,
+        active_tokens: Optional[Iterable[str]] = None,
+    ) -> User:
+        """Persist privacy settings and active authentication tokens."""
+
+        if privacy_settings is not None:
+            user.privacy_settings = dict(privacy_settings)
+        if active_tokens is not None:
+            user.active_tokens = self._normalize_tokens(active_tokens)
+        self.session.flush()
+        return user
+
+    def record_activity(
+        self,
+        user: User,
+        *,
+        activity_type: str,
+        description: Optional[str] = None,
+        score_delta: int = 0,
+    ) -> UserActivity:
+        """Append a new activity entry for the user."""
+
+        entry = UserActivity(
+            user=user,
+            activity_type=activity_type,
+            description=description,
+            score_delta=score_delta,
+        )
+        if score_delta:
+            new_score = (user.engagement_score or 0) + score_delta
+            user.engagement_score = max(0, new_score)
+        self.session.add(entry)
+        self.session.flush()
+        return entry
+
+    def list_activities(
+        self,
+        user: User,
+        *,
+        limit: int = 50,
+    ) -> list[UserActivity]:
+        stmt = (
+            select(UserActivity)
+            .where(UserActivity.user_id == user.id)
+            .order_by(UserActivity.created_at.desc(), UserActivity.id.desc())
+            .limit(limit)
+        )
+        return self.session.execute(stmt).scalars().all()
+
+    def create_verification(
+        self,
+        user: User,
+        *,
+        method: str,
+        code: str,
+        expires_at: Optional[datetime] = None,
+    ) -> UserVerification:
+        existing = self.get_verification(user.id, method)
+        if existing:
+            existing.code = code
+            existing.status = "pending"
+            existing.attempts = 0
+            existing.expires_at = expires_at
+            existing.verified_at = None
+            verification = existing
+        else:
+            verification = UserVerification(
+                user=user,
+                method=method,
+                code=code,
+                expires_at=expires_at,
+            )
+            self.session.add(verification)
+        self.session.flush()
+        return verification
+
+    def get_verification(
+        self, user_id: int, method: str
+    ) -> Optional[UserVerification]:
+        stmt = (
+            select(UserVerification)
+            .where(
+                UserVerification.user_id == user_id,
+                UserVerification.method == method,
+            )
+        )
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def get_verification_by_id(
+        self, verification_id: int
+    ) -> Optional[UserVerification]:
+        return self.session.get(UserVerification, verification_id)
+
+    def confirm_verification(
+        self,
+        verification: UserVerification,
+        *,
+        provided_code: str,
+        at: Optional[datetime] = None,
+    ) -> bool:
+        if at is not None:
+            now = at
+        else:
+            now = datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        verification.attempts = (verification.attempts or 0) + 1
+        expires_at = verification.expires_at
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at and now > expires_at:
+            verification.status = "expired"
+            self.session.flush()
+            return False
+        if verification.code != provided_code:
+            verification.status = "pending"
+            self.session.flush()
+            return False
+        verification.status = "verified"
+        verification.verified_at = now
+        self.session.flush()
+        return True
+
+    def create_connection(
+        self,
+        user: User,
+        *,
+        connection_type: str,
+        status: str = "pending",
+        target_user_id: Optional[int] = None,
+        external_reference: Optional[str] = None,
+        attributes: Optional[dict[str, object]] = None,
+    ) -> UserConnection:
+        connection = UserConnection(
+            user=user,
+            connection_type=connection_type,
+            status=status,
+            target_user_id=target_user_id,
+            external_reference=external_reference,
+            attributes=attributes,
+        )
+        self.session.add(connection)
+        self.session.flush()
+        return connection
+
+    def update_connection_status(
+        self,
+        connection: UserConnection,
+        *,
+        status: str,
+        attributes: Optional[dict[str, object]] = None,
+    ) -> UserConnection:
+        connection.status = status
+        if attributes is not None:
+            connection.attributes = attributes
+        self.session.flush()
+        return connection
+
+    def delete_connection(self, connection: UserConnection) -> None:
+        self.session.delete(connection)
+        self.session.flush()
+
+    def list_connections(
+        self,
+        user: User,
+        *,
+        status: Optional[str] = None,
+    ) -> list[UserConnection]:
+        stmt = select(UserConnection).where(UserConnection.user_id == user.id)
+        if status:
+            stmt = stmt.where(UserConnection.status == status)
+        stmt = stmt.order_by(
+            UserConnection.updated_at.desc(),
+            UserConnection.id.desc(),
+        )
+        return self.session.execute(stmt).scalars().all()
+
+    def get_connection_by_id(
+        self, connection_id: int
+    ) -> Optional[UserConnection]:
+        return self.session.get(UserConnection, connection_id)
+
+    def create_session(
+        self,
+        user: User,
+        *,
+        session_token: str,
+        encrypted_payload: Optional[str] = None,
+        ip_address: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+    ) -> UserSession:
+        record = UserSession(
+            user=user,
+            session_token=session_token,
+            encrypted_payload=encrypted_payload,
+            ip_address=ip_address,
+            user_agent=user_agent,
+            expires_at=expires_at,
+        )
+        self.session.add(record)
+        self.session.flush()
+        return record
+
+    def list_sessions(self, user: User) -> list[UserSession]:
+        stmt = (
+            select(UserSession)
+            .where(UserSession.user_id == user.id)
+            .order_by(UserSession.created_at.desc(), UserSession.id.desc())
+        )
+        return self.session.execute(stmt).scalars().all()
+
+    def get_session_by_id(self, session_id: int) -> Optional[UserSession]:
+        return self.session.get(UserSession, session_id)
+
+    def get_session_by_token(self, token: str) -> Optional[UserSession]:
+        stmt = select(UserSession).where(UserSession.session_token == token)
+        return self.session.execute(stmt).scalar_one_or_none()
+
+    def revoke_session(
+        self,
+        session_record: UserSession,
+        *,
+        revoked_at: Optional[datetime] = None,
+    ) -> UserSession:
+        if revoked_at is None:
+            revoked_at = datetime.now(timezone.utc)
+        elif revoked_at.tzinfo is None:
+            revoked_at = revoked_at.replace(tzinfo=timezone.utc)
+        session_record.revoked_at = revoked_at
+        self.session.flush()
+        return session_record
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
     @staticmethod
@@ -321,3 +575,15 @@ class UserRepository:
         )
         records = self.session.execute(result_stmt).scalars().unique().all()
         return records, total
+
+    @staticmethod
+    def _normalize_tokens(tokens: Iterable[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for token in tokens:
+            token_str = str(token).strip()
+            if not token_str or token_str in seen:
+                continue
+            seen.add(token_str)
+            normalized.append(token_str)
+        return normalized
