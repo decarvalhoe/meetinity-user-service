@@ -16,6 +16,7 @@ from src.schemas.user import (
     UserConnectionSchema,
     UserSchema,
     UserSessionSchema,
+    UserVerificationSchema,
     UserUpdateSchema,
 )
 from src.services.uploads import UploadError, save_user_photo
@@ -33,6 +34,7 @@ session_schema = UserSessionSchema()
 sessions_schema = UserSessionSchema(many=True)
 connection_schema = UserConnectionSchema()
 connections_schema = UserConnectionSchema(many=True)
+verification_schema = UserVerificationSchema()
 
 DEFAULT_SORT = ("created_at", "desc")
 ALLOWED_SORT_FIELDS = {
@@ -217,6 +219,122 @@ def update_privacy(user_id: int):
     return jsonify({"user": serialized})
 
 
+@users_bp.get("/<int:user_id>/privacy")
+def get_privacy(user_id: int):
+    """Return stored privacy metadata for a user."""
+
+    user, error = _execute_user_repo(
+        "users.privacy.get", lambda repo: repo.get(user_id)
+    )
+    if error:
+        return error
+    if user is None:
+        return error_response(404, "user not found")
+    payload = {
+        "user_id": user_id,
+        "privacy_settings": user.privacy_settings or {},
+        "privacy_level": user.privacy_level,
+        "active_tokens": user.active_tokens or [],
+    }
+    return jsonify(payload)
+
+
+@users_bp.post("/<int:user_id>/verify")
+def verify_user(user_id: int):
+    """Confirm a verification code for a user."""
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return error_response(400, "missing request body")
+    method = payload.get("method")
+    code = payload.get("code")
+    if not isinstance(method, str) or not method.strip():
+        return error_response(422, "verification method required")
+    if not isinstance(code, str) or not code.strip():
+        return error_response(422, "verification code required")
+
+    try:
+        with transactional_session(name="users.verify") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            verification = repo.get_verification(user_id, method.strip())
+            if verification is None:
+                return error_response(404, "verification not found")
+            success = repo.confirm_verification(
+                verification,
+                provided_code=code.strip(),
+            )
+            verification_payload = verification_schema.dump(verification)
+            user_payload = user_schema.dump(user)
+            status = verification.status
+    except RepositoryError as exc:
+        return repository_error_response(exc)
+
+    if success:
+        _invalidate_profile_cache(user_id)
+        response = jsonify(
+            {
+                "verified": True,
+                "verification": verification_payload,
+                "user": user_payload,
+            }
+        )
+        response.status_code = 200
+        return response
+
+    reason = "expired" if status == "expired" else "invalid_code"
+    response = jsonify(
+        {
+            "verified": False,
+            "reason": reason,
+            "verification": verification_payload,
+            "user": user_payload,
+        }
+    )
+    response.status_code = 409
+    return response
+
+
+@users_bp.post("/<int:user_id>/deactivate")
+def deactivate_user(user_id: int):
+    """Deactivate a user profile and optionally schedule reactivation."""
+
+    payload = request.get_json(silent=True) or {}
+    reactivation_raw = payload.get("reactivate_at") or payload.get(
+        "reactivation_at"
+    )
+    reactivation_at = None
+    if reactivation_raw:
+        try:
+            reactivation_at = _parse_iso_datetime(str(reactivation_raw))
+        except ValueError as exc:
+            return error_response(422, str(exc))
+
+    try:
+        with transactional_session(name="users.deactivate") as session:
+            repo = UserRepository(session)
+            user = repo.get(user_id)
+            if user is None:
+                return error_response(404, "user not found")
+            updated = repo.deactivate(user, reactivation_at=reactivation_at)
+            user_payload = user_schema.dump(updated)
+    except RepositoryError as exc:
+        return repository_error_response(exc)
+
+    _invalidate_profile_cache(user_id)
+    response = jsonify(
+        {
+            "user": user_payload,
+            "deactivated_at": user_payload.get("deactivated_at"),
+            "reactivation_at": user_payload.get("reactivation_at"),
+        }
+    )
+    response.status_code = 200
+    return response
+
+
 @users_bp.post("/<int:user_id>/photo")
 def upload_photo(user_id: int):
     """Upload and associate a profile photo."""
@@ -337,6 +455,12 @@ def search_users():
 
     try:
         page, per_page, sort, filters = _parse_listing_args(request.args)
+        recommendation_limit = _parse_int(
+            request.args.get("recommendations"),
+            default=5,
+            min_value=1,
+            max_value=20,
+        )
     except ValueError as exc:
         return error_response(400, str(exc))
 
@@ -348,11 +472,13 @@ def search_users():
             per_page=per_page,
             sort=sort,
             filters=filters,
+            include_recommendations=True,
+            recommendation_limit=recommendation_limit or 5,
         ),
     )
     if error:
         return error
-    items, total = result
+    items, total, recommendations = result
     return jsonify(
         {
             "items": users_schema.dump(items),
@@ -360,6 +486,66 @@ def search_users():
             "per_page": per_page,
             "total": total,
             "query": query,
+            "recommendations": users_schema.dump(recommendations),
+            "recommendation_limit": recommendation_limit or 5,
+        }
+    )
+
+
+@users_bp.get("/discover")
+def discover_users():
+    """Expose discovery recommendations based on activity and skills."""
+
+    query = (request.args.get("q") or "").strip()
+
+    try:
+        page, per_page, sort, filters = _parse_listing_args(request.args)
+        recommendation_limit = _parse_int(
+            request.args.get("recommendations"),
+            default=6,
+            min_value=1,
+            max_value=20,
+        )
+    except ValueError as exc:
+        return error_response(400, str(exc))
+
+    base_user_id = request.args.get("user_id")
+    try:
+        with transactional_session(name="users.discover") as session:
+            repo = UserRepository(session)
+            base_user = None
+            if base_user_id:
+                try:
+                    parsed_id = int(base_user_id)
+                except (TypeError, ValueError):
+                    return error_response(400, "invalid user_id")
+                base_user = repo.get(parsed_id)
+                if base_user is None:
+                    return error_response(404, "user not found")
+            items, total, recommendations = repo.search_users(
+                query=query,
+                page=page,
+                per_page=per_page,
+                sort=sort,
+                filters=filters,
+                include_recommendations=True,
+                base_user=base_user,
+                recommendation_limit=recommendation_limit or 6,
+            )
+            context_user_id = base_user.id if base_user else None
+    except RepositoryError as exc:
+        return repository_error_response(exc)
+
+    return jsonify(
+        {
+            "items": users_schema.dump(items),
+            "total": total,
+            "page": page,
+            "per_page": per_page,
+            "query": query,
+            "recommendations": users_schema.dump(recommendations),
+            "recommendation_limit": recommendation_limit or 6,
+            "context_user_id": context_user_id,
         }
     )
 

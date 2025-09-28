@@ -134,6 +134,30 @@ class User(Base):
         default=0,
         server_default="0",
     )
+    profile_completeness: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    trust_score: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    privacy_level: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="standard",
+        server_default=text("'standard'"),
+    )
+    deactivated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    reactivation_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     privacy_settings: Mapped[dict[str, object]] = mapped_column(
         JSON,
         nullable=False,

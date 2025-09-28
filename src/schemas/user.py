@@ -104,8 +104,13 @@ class UserSchema(Schema):
     is_active = fields.Boolean()
     engagement_score = fields.Integer(required=True)
     reputation_score = fields.Integer(required=True)
+    profile_completeness = fields.Integer(required=True)
+    trust_score = fields.Integer(required=True)
+    privacy_level = fields.String(required=True)
     privacy_settings = fields.Dict(keys=fields.String(), values=fields.Raw())
     active_tokens = fields.List(fields.String(), dump_default=list)
+    deactivated_at = fields.DateTime(allow_none=True)
+    reactivation_at = fields.DateTime(allow_none=True)
     preferences = fields.Method("_dump_preferences")
     social_accounts = fields.List(
         fields.Nested(UserSocialAccountSchema),
@@ -154,6 +159,9 @@ class UserSchema(Schema):
         data.setdefault("connections", [])
         data.setdefault("sessions", [])
         data.setdefault("privacy_settings", {})
+        data.setdefault("profile_completeness", 0)
+        data.setdefault("trust_score", 0)
+        data.setdefault("privacy_level", "standard")
         return data
 
     @staticmethod

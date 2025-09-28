@@ -32,3 +32,9 @@ Le service utilisateur est l'un des services les plus matures de la plateforme. 
 - **Nettoyer les Issues Obsolètes :** Les issues obsolètes devraient être fermées pour maintenir un backlog propre et pertinent.
 - **Documenter l'API :** Une documentation complète de l'API, éventuellement générée automatiquement à partir du code, faciliterait l'intégration avec d'autres services et les clients.
 
+## 5. Nouveautés récentes
+
+- **Découverte d'utilisateurs :** Un endpoint `/users/discover` propose désormais des recommandations basées sur la similarité des compétences et l'activité récente, en complément des résultats de recherche classiques.
+- **Scores de profil automatisés :** Les champs `profile_completeness`, `trust_score` et `privacy_level` sont calculés automatiquement via le service `profile_metrics`. Ils sont mis à jour à chaque modification de profil, lors des connexions OAuth et pendant les flux de vérification.
+- **Gestion de la vie privée et désactivation :** De nouvelles routes REST permettent de consulter et d'ajuster le niveau de confidentialité (`GET/PUT /users/<id>/privacy`), de confirmer un code de vérification (`POST /users/<id>/verify`) et de désactiver un compte avec reactivation planifiée (`POST /users/<id>/deactivate`). Les dates de désactivation sont stockées pour faciliter la rétention et la réactivation.
+
