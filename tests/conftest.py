@@ -13,9 +13,13 @@ os.environ.setdefault(
 os.environ.setdefault(
     "LINKEDIN_REDIRECT_URI", "http://localhost/auth/linkedin/callback"
 )
+os.environ.setdefault(
+    "APP_ENCRYPTION_KEY", "M-3-SHhAXx0eSuuomrMuvBHZkE6uNOA3y-38SWFz3qg="
+)
 
 from src.db.session import Base, get_engine, reset_engine  # noqa: E402
 from src.main import create_app  # noqa: E402
+import src.models.audit  # noqa: F401,E402
 
 
 @pytest.fixture(scope="session")

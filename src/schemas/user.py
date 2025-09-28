@@ -71,13 +71,19 @@ class UserSessionSchema(Schema):
     """Schema for encrypted sessions."""
 
     id = fields.Integer(required=True)
-    session_token = fields.String(required=True)
+    session_token = fields.Method("_dump_session_token", required=True)
     encrypted_payload = fields.String(allow_none=True)
     ip_address = fields.String(allow_none=True)
     user_agent = fields.String(allow_none=True)
     created_at = fields.DateTime(required=True)
     expires_at = fields.DateTime(allow_none=True)
     revoked_at = fields.DateTime(allow_none=True)
+
+    def _dump_session_token(self, obj) -> str:
+        value = getattr(obj, "session_token", "") or ""
+        if len(value) <= 12:
+            return value
+        return f"{value[:6]}…{value[-6:]}"
 
 
 class UserSchema(Schema):
@@ -106,6 +112,9 @@ class UserSchema(Schema):
     reputation_score = fields.Integer(required=True)
     privacy_settings = fields.Dict(keys=fields.String(), values=fields.Raw())
     active_tokens = fields.List(fields.String(), dump_default=list)
+    deactivated_at = fields.DateTime(allow_none=True)
+    pseudonymized_at = fields.DateTime(allow_none=True)
+    scheduled_purge_at = fields.DateTime(allow_none=True)
     preferences = fields.Method("_dump_preferences")
     social_accounts = fields.List(
         fields.Nested(UserSocialAccountSchema),

@@ -27,6 +27,12 @@ def _parse_origins(raw: Optional[str]) -> List[str]:
     return [origin.strip() for origin in raw.split(",") if origin.strip()]
 
 
+def _parse_list(raw: Optional[str]) -> List[str]:
+    if not raw:
+        return []
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def _parse_int(value: Optional[str], default: int) -> int:
     if value is None:
         return default
@@ -54,6 +60,10 @@ class Config:
     jwt_secret: str = "change_me"
     jwt_algorithm: str = "HS256"
     jwt_ttl_minutes: int = 60
+    encryption_primary_key: str = ""
+    encryption_fallback_keys: List[str] = field(default_factory=list)
+    encryption_rotation_days: int = 90
+    account_retention_days: int = 30
     database_read_replica_url: Optional[str] = None
     database_backup_url: Optional[str] = None
     database_restore_url: Optional[str] = None
@@ -88,6 +98,16 @@ def get_config() -> Config:
         jwt_secret=os.getenv("JWT_SECRET", "change_me"),
         jwt_algorithm=os.getenv("JWT_ALGO", "HS256"),
         jwt_ttl_minutes=_parse_int(os.getenv("JWT_TTL_MIN"), 60),
+        encryption_primary_key=os.getenv("APP_ENCRYPTION_KEY", ""),
+        encryption_fallback_keys=_parse_list(
+            os.getenv("APP_ENCRYPTION_FALLBACK_KEYS")
+        ),
+        encryption_rotation_days=_parse_int(
+            os.getenv("APP_ENCRYPTION_ROTATION_DAYS"), 90
+        ),
+        account_retention_days=_parse_int(
+            os.getenv("ACCOUNT_RETENTION_DAYS"), 30
+        ),
         database_read_replica_url=os.getenv("DATABASE_READ_REPLICA_URL"),
         database_backup_url=os.getenv("DATABASE_BACKUP_URL"),
         database_restore_url=os.getenv("DATABASE_RESTORE_URL"),

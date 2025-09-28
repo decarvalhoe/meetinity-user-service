@@ -33,6 +33,8 @@ class User(Base):
         Index("ix_users_last_login", "last_login"),
         Index("ix_users_last_active_at", "last_active_at"),
         Index("ix_users_experience_years", "experience_years"),
+        Index("ix_users_deactivated_at", "deactivated_at"),
+        Index("ix_users_scheduled_purge_at", "scheduled_purge_at"),
     )
 
     id: Mapped[int] = mapped_column(
@@ -149,6 +151,15 @@ class User(Base):
         nullable=False,
         default=list,
         server_default=text("'[]'"),
+    )
+    deactivated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    pseudonymized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    scheduled_purge_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
     )
 
     def touch_login(self, at: datetime) -> None:

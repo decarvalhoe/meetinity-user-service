@@ -180,7 +180,7 @@ class CacheService:
     def invalidate_prefix(self, prefix: str) -> None:
         if not self.enabled:
             return
-        pattern = f"{prefix}:*"
+        pattern = f"{prefix}" + ":*"
         start = time.perf_counter()
         try:
             to_delete: list[str] = []
