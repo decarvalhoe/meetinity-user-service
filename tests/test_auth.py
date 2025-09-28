@@ -7,7 +7,7 @@ import pytest
 
 from src.auth.oauth import generate_nonce, generate_state
 from src.db.session import session_scope
-from src.models.user_repository import UserRepository
+from src.models.repositories import RepositoryError, UserRepository
 
 
 class DummyResponse:
@@ -242,6 +242,22 @@ def test_profile_caching(monkeypatch, client):
     )
     assert second.status_code == 200
     client.application.extensions.pop("redis_client", None)
+
+
+def test_profile_repository_error(monkeypatch, client):
+    monkeypatch.setattr(
+        "src.auth.jwt_handler.decode_jwt", lambda _token: {"sub": 999}
+    )
+
+    def _raise(*_args, **_kwargs):
+        raise RepositoryError("db failure")
+
+    monkeypatch.setattr("src.routes.auth.UserRepository.get", _raise)
+    response = client.get(
+        "/auth/profile", headers={"Authorization": "Bearer t"}
+    )
+    assert response.status_code == 500
+    assert response.get_json()["error"]["message"] == "db failure"
 
 
 def test_repository_helpers():

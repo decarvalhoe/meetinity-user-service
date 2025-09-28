@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from flask import jsonify
+from flask import current_app, jsonify
+
+from src.models.repositories import RepositoryError
 
 
 def error_response(
@@ -22,3 +24,10 @@ def error_response(
         }
     }
     return jsonify(payload), status_code
+
+
+def repository_error_response(error: RepositoryError):
+    """Log a repository error and convert it into an API response."""
+
+    current_app.logger.exception("repository error: %s", error)
+    return error_response(error.status_code, error.message, error.details)

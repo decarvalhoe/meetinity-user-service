@@ -107,18 +107,13 @@ def get_session() -> Session:
 
 
 @contextmanager
-def session_scope() -> Iterator[Session]:
+def session_scope(*, name: str = "session") -> Iterator[Session]:
     """Provide a transactional scope around a series of operations."""
 
-    session = get_session()
-    try:
+    from src.services.transactions import transactional_session
+
+    with transactional_session(name=name) as session:
         yield session
-        session.commit()
-    except Exception:
-        session.rollback()
-        raise
-    finally:
-        session.close()
 
 
 def reset_engine() -> None:
