@@ -34,6 +34,7 @@ class UserActivityRepository(SQLAlchemyRepository):
             user.engagement_score = max(0, new_score)
         self.session.add(entry)
         self._flush()
+        self._invalidate_profile_cache(user.id)
         return entry
 
     @repository_method

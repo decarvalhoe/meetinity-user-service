@@ -57,10 +57,8 @@ class UserCoreRepository(SQLAlchemyRepository):
         validate_email(normalized_email)
 
         user = self.get_by_email(normalized_email)
-        created = False
         if user is None:
             user = User(email=normalized_email)
-            created = True
             self.session.add(user)
         else:
             user.email = normalized_email
@@ -85,8 +83,9 @@ class UserCoreRepository(SQLAlchemyRepository):
             connected_at=last_login,
         )
 
-        if created:
-            self._flush()
+        self._flush()
+        self._invalidate_profile_cache(user.id)
+        self._invalidate_listing_cache()
 
         return user
 
@@ -128,6 +127,8 @@ class UserCoreRepository(SQLAlchemyRepository):
         )
         self.session.add(user)
         self._flush()
+        self._invalidate_profile_cache(user.id)
+        self._invalidate_listing_cache()
         return user
 
     @repository_method
@@ -160,23 +161,132 @@ class UserCoreRepository(SQLAlchemyRepository):
             user.active_tokens = normalize_tokens(data["active_tokens"])
 
         self._flush()
+        self._invalidate_profile_cache(user.id)
+        self._invalidate_listing_cache()
         return user
 
     @repository_method
     def delete_user(self, user: User) -> None:
         self.session.delete(user)
         self._flush()
+        self._invalidate_profile_cache(user.id)
+        self._invalidate_listing_cache()
 
     @repository_method
     def set_photo_url(self, user: User, photo_url: str) -> User:
         user.photo_url = photo_url
         self._flush()
+        self._invalidate_profile_cache(user.id)
         return user
 
     @repository_method
     def deactivate(self, user: User) -> None:
         user.is_active = False
         self._flush()
+        self._invalidate_profile_cache(user.id)
+        self._invalidate_listing_cache()
+
+    @repository_method
+    def bulk_import_users(
+        self,
+        records: Iterable[dict[str, object]],
+        *,
+        update_existing: bool = True,
+    ) -> list[User]:
+        prepared: list[tuple[str, dict[str, object]]] = []
+        for record in records:
+            if "email" not in record:
+                raise ValueError("email is required for bulk import")
+            normalized_email = normalize_email(str(record["email"]))
+            validate_email(normalized_email)
+            prepared.append((normalized_email, dict(record)))
+
+        if not prepared:
+            return []
+
+        emails = [email for email, _ in prepared]
+        existing_records = (
+            self.session.execute(select(User).where(User.email.in_(emails)))
+            .scalars()
+            .unique()
+            .all()
+        )
+        existing = {user.email: user for user in existing_records}
+
+        seen: set[int] = set()
+        touched: list[User] = []
+
+        for email, payload in prepared:
+            user = existing.get(email)
+            if user is None:
+                user = User(email=email)
+                existing[email] = user
+                self.session.add(user)
+            elif not update_existing:
+                continue
+
+            # Update scalar fields when provided
+            for field in (
+                "name",
+                "title",
+                "company",
+                "location",
+                "industry",
+                "linkedin_url",
+                "experience_years",
+                "bio",
+                "timezone",
+                "provider",
+                "provider_user_id",
+            ):
+                if field in payload:
+                    setattr(user, field, payload[field])
+
+            if "is_active" in payload:
+                user.is_active = bool(payload["is_active"])
+            if "skills" in payload:
+                user.skills = encode_string_list(payload.get("skills"))
+            if "interests" in payload:
+                user.interests = encode_string_list(payload.get("interests"))
+            if (
+                "active_tokens" in payload
+                and payload["active_tokens"] is not None
+            ):
+                user.active_tokens = normalize_tokens(payload["active_tokens"])
+            if (
+                "privacy_settings" in payload
+                and payload["privacy_settings"] is not None
+            ):
+                user.privacy_settings = dict(payload["privacy_settings"])
+
+            for field in ("last_login", "last_active_at", "updated_at"):
+                if field in payload and payload[field] is not None:
+                    setattr(user, field, payload[field])
+
+            if (
+                "engagement_score" in payload
+                and payload["engagement_score"] is not None
+            ):
+                user.engagement_score = int(payload["engagement_score"])
+            if (
+                "reputation_score" in payload
+                and payload["reputation_score"] is not None
+            ):
+                user.reputation_score = int(payload["reputation_score"])
+
+            marker = id(user)
+            if marker not in seen:
+                seen.add(marker)
+                touched.append(user)
+
+        if not touched:
+            return []
+
+        self._flush()
+        self._invalidate_listing_cache()
+        for user in touched:
+            self._invalidate_profile_cache(user.id)
+        return touched
 
     @repository_method
     def list_users(

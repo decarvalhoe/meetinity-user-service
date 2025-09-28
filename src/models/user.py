@@ -29,6 +29,10 @@ class User(Base):
     __table_args__ = (
         Index("ix_users_industry_location", "industry", "location"),
         Index("ix_users_created_at", "created_at"),
+        Index("ix_users_updated_at", "updated_at"),
+        Index("ix_users_last_login", "last_login"),
+        Index("ix_users_last_active_at", "last_active_at"),
+        Index("ix_users_experience_years", "experience_years"),
     )
 
     id: Mapped[int] = mapped_column(

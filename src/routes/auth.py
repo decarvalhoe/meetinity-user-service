@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """Authentication routes for the User Service."""
 
-import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -96,10 +95,13 @@ def auth_callback(provider: str):
         if not email:
             return error_response(422, "email required")
         now = datetime.now(timezone.utc)
-        redis_client = current_app.extensions.get("redis_client")
+        cache_service = current_app.extensions.get("cache_service")
         try:
             with transactional_session(name="auth.oauth") as db_session:
-                repo = UserRepository(db_session)
+                cache_hooks = (
+                    cache_service.build_hooks() if cache_service else None
+                )
+                repo = UserRepository(db_session, cache_hooks=cache_hooks)
                 user = repo.upsert_oauth_user(
                     email=email,
                     provider=provider,
@@ -121,11 +123,10 @@ def auth_callback(provider: str):
             return error_response(422, str(exc))
         except RepositoryError as exc:
             return repository_error_response(exc)
-        if redis_client:
-            redis_client.setex(
-                _profile_cache_key(user.id),
-                current_app.config["APP_CONFIG"].redis_cache_ttl,
-                json.dumps(profile),
+        if cache_service and cache_service.enabled:
+            cache_service.set_json(
+                cache_service.profile_key(user.id),
+                profile,
             )
         token = encode_jwt(user)
         return jsonify({"token": token, "user": profile})
@@ -183,7 +184,11 @@ def request_verification():
         with transactional_session(
             name="auth.verification.request"
         ) as db_session:
-            repo = UserRepository(db_session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(db_session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -216,7 +221,11 @@ def confirm_verification():
         with transactional_session(
             name="auth.verification.confirm"
         ) as db_session:
-            repo = UserRepository(db_session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(db_session, cache_hooks=cache_hooks)
             verification = repo.get_verification_by_id(verification_id)
             if verification is None:
                 return error_response(404, "verification not found")
@@ -242,16 +251,20 @@ def profile():
         Response: A JSON response with the user's profile information.
     """
     user_id = request.user["sub"]
-    redis_client = current_app.extensions.get("redis_client")
-    cache_key = _profile_cache_key(user_id)
-    if redis_client:
-        cached = redis_client.get(cache_key)
-        if cached:
-            return jsonify({"user": json.loads(cached)})
+    cache_service = current_app.extensions.get("cache_service")
+    cache_key = None
+    if cache_service and cache_service.enabled:
+        cache_key = cache_service.profile_key(user_id)
+        cached = cache_service.get_json(cache_key)
+        if cached is not None:
+            return jsonify({"user": cached})
 
     try:
         with transactional_session(name="auth.profile") as db_session:
-            repo = UserRepository(db_session)
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(db_session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if not user:
                 return error_response(404, "user not found")
@@ -259,18 +272,10 @@ def profile():
     except RepositoryError as exc:
         return repository_error_response(exc)
 
-    if redis_client:
-        redis_client.setex(
-            cache_key,
-            current_app.config["APP_CONFIG"].redis_cache_ttl,
-            json.dumps(profile),
-        )
+    if cache_service and cache_key:
+        cache_service.set_json(cache_key, profile)
 
     return jsonify({"user": profile})
-
-
-def _profile_cache_key(user_id: int) -> str:
-    return "user:profile:" + str(user_id)
 
 
 def _serialize_user(user) -> Dict[str, Any]:

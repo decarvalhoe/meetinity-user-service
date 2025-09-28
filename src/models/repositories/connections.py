@@ -35,6 +35,7 @@ class UserConnectionRepository(SQLAlchemyRepository):
         )
         self.session.add(connection)
         self._flush()
+        self._invalidate_profile_cache(user.id)
         return connection
 
     @repository_method
@@ -49,12 +50,15 @@ class UserConnectionRepository(SQLAlchemyRepository):
         if attributes is not None:
             connection.attributes = attributes
         self._flush()
+        self._invalidate_profile_cache(connection.user_id)
         return connection
 
     @repository_method
     def delete_connection(self, connection: UserConnection) -> None:
+        user_id = connection.user_id
         self.session.delete(connection)
         self._flush()
+        self._invalidate_profile_cache(user_id)
 
     @repository_method
     def list_connections(

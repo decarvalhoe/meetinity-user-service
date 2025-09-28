@@ -11,23 +11,41 @@ import pytest
 
 from src.db.session import session_scope
 from src.models.repositories import RepositoryError, UserRepository
-from src.routes.auth import _profile_cache_key
+from src.services.cache import CacheService
 
 
 class DummyRedis:
     """Minimal Redis-like interface for testing cache invalidation."""
 
     def __init__(self):
-        self.store: dict[str, object] = {}
+        self.store: dict[str, str] = {}
 
     def get(self, key: str):
         return self.store.get(key)
 
     def setex(self, key: str, ttl: int, value: object):
-        self.store[key] = value
+        self.store[key] = value if isinstance(value, str) else str(value)
 
-    def delete(self, key: str):
-        self.store.pop(key, None)
+    def set(self, key: str, value: object):
+        self.store[key] = value if isinstance(value, str) else str(value)
+
+    def delete(self, *keys: str):
+        for key in keys:
+            self.store.pop(key, None)
+
+    def scan_iter(self, match: str | None = None):
+        keys = list(self.store.keys())
+        if match is None:
+            for key in keys:
+                yield key
+            return
+        if match.endswith("*"):
+            prefix = match[:-1]
+            for key in keys:
+                if key.startswith(prefix):
+                    yield key
+        elif match in self.store:
+            yield match
 
 
 @pytest.fixture
@@ -81,6 +99,30 @@ def test_list_users_with_filters(client, seeded_users):
     assert payload["items"][0]["skills"] == ["python", "flask"]
 
 
+def test_list_users_uses_cache(client, seeded_users, monkeypatch):
+    app = client.application
+    fake_cache = DummyRedis()
+    previous_cache = app.extensions.get("cache_service")
+    app.extensions["cache_service"] = CacheService(fake_cache, 60)
+    try:
+        first = client.get("/users", query_string={"page": 1, "per_page": 2})
+        assert first.status_code == 200
+        assert fake_cache.store  # cache populated
+
+        def _fail(*_args, **_kwargs):  # pragma: no cover - should not run
+            raise AssertionError("repository executed despite cache")
+
+        monkeypatch.setattr("src.routes.users._execute_user_repo", _fail)
+        second = client.get("/users", query_string={"page": 1, "per_page": 2})
+        assert second.status_code == 200
+        assert second.get_json() == first.get_json()
+    finally:
+        if previous_cache is not None:
+            app.extensions["cache_service"] = previous_cache
+        else:
+            app.extensions.pop("cache_service", None)
+
+
 def test_get_user_returns_profile(client, seeded_users):
     alice_id = seeded_users["alice"].id
     response = client.get(f"/users/{alice_id}")
@@ -116,10 +158,11 @@ def test_update_user_clears_cached_profile(client, seeded_users):
     alice_id = seeded_users["alice"].id
     fake_cache = DummyRedis()
     app = client.application
-    previous_cache = app.extensions.get("redis_client")
-    app.extensions["redis_client"] = fake_cache
-    cache_key = _profile_cache_key(alice_id)
-    fake_cache.setex(cache_key, 60, {"name": "Old Alice"})
+    previous_cache_service = app.extensions.get("cache_service")
+    app.extensions["cache_service"] = CacheService(fake_cache, 60)
+    cache_service: CacheService = app.extensions["cache_service"]
+    cache_key = cache_service.profile_key(alice_id)
+    cache_service.set_json(cache_key, {"name": "Old Alice"})
 
     try:
         response = client.put(
@@ -129,10 +172,10 @@ def test_update_user_clears_cached_profile(client, seeded_users):
         assert response.status_code == 200
         assert cache_key not in fake_cache.store
     finally:
-        if previous_cache is not None:
-            app.extensions["redis_client"] = previous_cache
+        if previous_cache_service is not None:
+            app.extensions["cache_service"] = previous_cache_service
         else:
-            app.extensions.pop("redis_client", None)
+            app.extensions.pop("cache_service", None)
 
 
 def test_delete_user(client, seeded_users):
@@ -178,6 +221,36 @@ def test_search_users(client, seeded_users):
     emails = {item["email"] for item in data["items"]}
     assert "carol@example.com" in emails
     assert "alice@example.com" in emails
+
+
+def test_search_users_uses_cache(client, seeded_users, monkeypatch):
+    app = client.application
+    fake_cache = DummyRedis()
+    previous_cache = app.extensions.get("cache_service")
+    app.extensions["cache_service"] = CacheService(fake_cache, 60)
+    try:
+        first = client.get(
+            "/users/search",
+            query_string={"q": "alice", "page": 1, "per_page": 5},
+        )
+        assert first.status_code == 200
+        assert fake_cache.store
+
+        def _fail(*_args, **_kwargs):  # pragma: no cover - should not run
+            raise AssertionError("repository executed despite cache")
+
+        monkeypatch.setattr("src.routes.users._execute_user_repo", _fail)
+        second = client.get(
+            "/users/search",
+            query_string={"q": "alice", "page": 1, "per_page": 5},
+        )
+        assert second.status_code == 200
+        assert second.get_json() == first.get_json()
+    finally:
+        if previous_cache is not None:
+            app.extensions["cache_service"] = previous_cache
+        else:
+            app.extensions.pop("cache_service", None)
 
 
 def test_upsert_preferences_endpoint(client, seeded_users):
