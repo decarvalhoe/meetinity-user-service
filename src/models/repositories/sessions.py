@@ -36,6 +36,7 @@ class UserSessionRepository(SQLAlchemyRepository):
         )
         self.session.add(record)
         self._flush()
+        self._invalidate_profile_cache(user.id)
         return record
 
     @repository_method
@@ -69,6 +70,7 @@ class UserSessionRepository(SQLAlchemyRepository):
             revoked_at = revoked_at.replace(tzinfo=timezone.utc)
         session_record.revoked_at = revoked_at
         self._flush()
+        self._invalidate_profile_cache(session_record.user_id)
         return session_record
 
 

@@ -41,6 +41,7 @@ class UserVerificationRepository(SQLAlchemyRepository):
             )
             self.session.add(verification)
         self._flush()
+        self._invalidate_profile_cache(user.id)
         return verification
 
     @repository_method
@@ -83,14 +84,17 @@ class UserVerificationRepository(SQLAlchemyRepository):
         if expires_at and now > expires_at:
             verification.status = "expired"
             self._flush()
+            self._invalidate_profile_cache(verification.user_id)
             return False
         if verification.code != provided_code:
             verification.status = "pending"
             self._flush()
+            self._invalidate_profile_cache(verification.user_id)
             return False
         verification.status = "verified"
         verification.verified_at = now
         self._flush()
+        self._invalidate_profile_cache(verification.user_id)
         return True
 
 

@@ -9,7 +9,6 @@ from flask import Blueprint, Response, current_app, jsonify, request
 from marshmallow import ValidationError
 
 from src.models.repositories import RepositoryError, UserRepository
-from src.routes.auth import _profile_cache_key
 from src.routes.helpers import error_response, repository_error_response
 from src.schemas.user import (
     UserActivitySchema,
@@ -52,7 +51,11 @@ def _execute_user_repo(
 ) -> tuple[T | None, Response | tuple | None]:
     try:
         with transactional_session(name=transaction_name) as session:
-            repository = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repository = UserRepository(session, cache_hooks=cache_hooks)
             return handler(repository), None
     except RepositoryError as exc:
         return None, repository_error_response(exc)
@@ -67,6 +70,16 @@ def list_users():
     except ValueError as exc:
         return error_response(400, str(exc))
 
+    cache_service = current_app.extensions.get("cache_service")
+    cache_key = None
+    if cache_service and cache_service.enabled:
+        cache_key = cache_service.listing_key(
+            page=page, per_page=per_page, sort=sort, filters=filters
+        )
+        cached_payload = cache_service.get_json(cache_key)
+        if cached_payload is not None:
+            return jsonify(cached_payload)
+
     result, error = _execute_user_repo(
         "users.list",
         lambda repo: repo.list_users(
@@ -79,14 +92,15 @@ def list_users():
     if error:
         return error
     items, total = result
-    return jsonify(
-        {
-            "items": users_schema.dump(items),
-            "page": page,
-            "per_page": per_page,
-            "total": total,
-        }
-    )
+    payload = {
+        "items": users_schema.dump(items),
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+    }
+    if cache_service and cache_key:
+        cache_service.set_json(cache_key, payload)
+    return jsonify(payload)
 
 
 @users_bp.get("/<int:user_id>")
@@ -117,7 +131,11 @@ def update_user(user_id: int):
 
     try:
         with transactional_session(name="users.update") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -125,8 +143,6 @@ def update_user(user_id: int):
             response = jsonify({"user": user_schema.dump(updated)})
     except RepositoryError as exc:
         return repository_error_response(exc)
-
-    _invalidate_profile_cache(user_id)
 
     return response
 
@@ -137,15 +153,17 @@ def delete_user(user_id: int):
 
     try:
         with transactional_session(name="users.delete") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
             repo.delete_user(user)
     except RepositoryError as exc:
         return repository_error_response(exc)
-
-    _invalidate_profile_cache(user_id)
 
     return "", 204
 
@@ -169,7 +187,11 @@ def upsert_preferences(user_id: int):
 
     try:
         with transactional_session(name="users.preferences") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -178,7 +200,6 @@ def upsert_preferences(user_id: int):
     except RepositoryError as exc:
         return repository_error_response(exc)
 
-    _invalidate_profile_cache(user_id)
     return jsonify(
         {"preferences": serialized["preferences"], "user_id": user_id}
     )
@@ -200,7 +221,11 @@ def update_privacy(user_id: int):
 
     try:
         with transactional_session(name="users.privacy") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -213,7 +238,6 @@ def update_privacy(user_id: int):
     except RepositoryError as exc:
         return repository_error_response(exc)
 
-    _invalidate_profile_cache(user_id)
     return jsonify({"user": serialized})
 
 
@@ -235,7 +259,11 @@ def upload_photo(user_id: int):
 
     try:
         with transactional_session(name="users.photo") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -253,10 +281,6 @@ def upload_photo(user_id: int):
             response.status_code = 201
     except RepositoryError as exc:
         return repository_error_response(exc)
-
-    redis_client = current_app.extensions.get("redis_client")
-    if redis_client:
-        redis_client.delete(_profile_cache_key(user_id))
 
     return response
 
@@ -280,7 +304,11 @@ def log_activity(user_id: int):
 
     try:
         with transactional_session(name="users.activity") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -295,7 +323,6 @@ def log_activity(user_id: int):
     except RepositoryError as exc:
         return repository_error_response(exc)
 
-    _invalidate_profile_cache(user_id)
     return response
 
 
@@ -340,6 +367,20 @@ def search_users():
     except ValueError as exc:
         return error_response(400, str(exc))
 
+    cache_service = current_app.extensions.get("cache_service")
+    cache_key = None
+    if cache_service and cache_service.enabled:
+        cache_key = cache_service.search_key(
+            query=query,
+            page=page,
+            per_page=per_page,
+            sort=sort,
+            filters=filters,
+        )
+        cached_payload = cache_service.get_json(cache_key)
+        if cached_payload is not None:
+            return jsonify(cached_payload)
+
     result, error = _execute_user_repo(
         "users.search",
         lambda repo: repo.search_users(
@@ -353,15 +394,16 @@ def search_users():
     if error:
         return error
     items, total = result
-    return jsonify(
-        {
-            "items": users_schema.dump(items),
-            "page": page,
-            "per_page": per_page,
-            "total": total,
-            "query": query,
-        }
-    )
+    payload = {
+        "items": users_schema.dump(items),
+        "page": page,
+        "per_page": per_page,
+        "total": total,
+        "query": query,
+    }
+    if cache_service and cache_key:
+        cache_service.set_json(cache_key, payload)
+    return jsonify(payload)
 
 
 @users_bp.post("/<int:user_id>/sessions")
@@ -384,7 +426,11 @@ def create_session(user_id: int):
 
     try:
         with transactional_session(name="users.sessions.create") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -401,7 +447,6 @@ def create_session(user_id: int):
     except RepositoryError as exc:
         return repository_error_response(exc)
 
-    _invalidate_profile_cache(user_id)
     return response
 
 
@@ -429,7 +474,11 @@ def revoke_session(user_id: int, session_id: int):
 
     try:
         with transactional_session(name="users.sessions.revoke") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             record = repo.get_session_by_id(session_id)
             if record is None or record.user_id != user_id:
                 return error_response(404, "session not found")
@@ -437,7 +486,6 @@ def revoke_session(user_id: int, session_id: int):
     except RepositoryError as exc:
         return repository_error_response(exc)
 
-    _invalidate_profile_cache(user_id)
     return "", 204
 
 
@@ -457,7 +505,11 @@ def create_connection(user_id: int):
 
     try:
         with transactional_session(name="users.connections.create") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             user = repo.get(user_id)
             if user is None:
                 return error_response(404, "user not found")
@@ -475,7 +527,6 @@ def create_connection(user_id: int):
             response.status_code = 201
     except RepositoryError as exc:
         return repository_error_response(exc)
-    _invalidate_profile_cache(user_id)
     return response
 
 
@@ -519,7 +570,11 @@ def update_connection(user_id: int, connection_id: int):
 
     try:
         with transactional_session(name="users.connections.update") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             connection = repo.get_connection_by_id(connection_id)
             if connection is None or connection.user_id != user_id:
                 return error_response(404, "connection not found")
@@ -532,7 +587,6 @@ def update_connection(user_id: int, connection_id: int):
     except RepositoryError as exc:
         return repository_error_response(exc)
 
-    _invalidate_profile_cache(user_id)
     return jsonify({"connection": result})
 
 
@@ -542,14 +596,17 @@ def delete_connection(user_id: int, connection_id: int):
 
     try:
         with transactional_session(name="users.connections.delete") as session:
-            repo = UserRepository(session)
+            cache_service = current_app.extensions.get("cache_service")
+            cache_hooks = (
+                cache_service.build_hooks() if cache_service else None
+            )
+            repo = UserRepository(session, cache_hooks=cache_hooks)
             connection = repo.get_connection_by_id(connection_id)
             if connection is None or connection.user_id != user_id:
                 return error_response(404, "connection not found")
             repo.delete_connection(connection)
     except RepositoryError as exc:
         return repository_error_response(exc)
-    _invalidate_profile_cache(user_id)
     return "", 204
 
 
@@ -635,9 +692,3 @@ def _parse_iso_datetime(value: str) -> datetime:
         return datetime.fromisoformat(value)
     except ValueError as exc:  # pragma: no cover - python <3.11 compatibility
         raise ValueError("invalid datetime format") from exc
-
-
-def _invalidate_profile_cache(user_id: int) -> None:
-    redis_client = current_app.extensions.get("redis_client")
-    if redis_client:
-        redis_client.delete(_profile_cache_key(user_id))

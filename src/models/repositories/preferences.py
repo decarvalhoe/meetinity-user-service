@@ -32,6 +32,7 @@ class UserPreferenceRepository(SQLAlchemyRepository):
                 user.preferences.append(UserPreference(key=key, value=value))
 
         self._flush()
+        self._invalidate_profile_cache(user.id)
         return user
 
     @repository_method
@@ -47,6 +48,7 @@ class UserPreferenceRepository(SQLAlchemyRepository):
         if active_tokens is not None:
             user.active_tokens = normalize_tokens(active_tokens)
         self._flush()
+        self._invalidate_profile_cache(user.id)
         return user
 
 

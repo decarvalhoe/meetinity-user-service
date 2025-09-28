@@ -2,6 +2,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from unittest.mock import MagicMock
 
+from src.db.session import session_scope
 from src.models.repositories import RepositoryError, UserRepository
 from src.models.repositories.preferences import UserPreferenceRepository
 from src.models.repositories.sessions import UserSessionRepository
@@ -110,3 +111,49 @@ def test_delegate_registration_branches():
                 "create_user",
                 repo_module._make_delegate("create_user"),
             )
+
+
+def test_bulk_import_users_creates_and_updates_records():
+    with session_scope() as session:
+        repo = UserRepository(session)
+        created = repo.bulk_import_users(
+            [
+                {
+                    "email": "bulk-one@example.com",
+                    "name": "Bulk One",
+                    "location": "Paris",
+                },
+                {
+                    "email": "bulk-two@example.com",
+                    "name": "Bulk Two",
+                    "industry": "Finance",
+                },
+            ]
+        )
+        assert len(created) == 2
+        ids = {user.id for user in created}
+        assert len(ids) == 2
+
+    with session_scope() as session:
+        repo = UserRepository(session)
+        updated = repo.bulk_import_users(
+            [
+                {
+                    "email": "bulk-one@example.com",
+                    "name": "Bulk Uno",
+                    "location": "Berlin",
+                },
+                {
+                    "email": "bulk-three@example.com",
+                    "name": "Bulk Three",
+                    "industry": "Technology",
+                },
+            ]
+        )
+        assert len(updated) == 2
+        refreshed = repo.get_by_email("bulk-one@example.com")
+        assert refreshed is not None
+        assert refreshed.name == "Bulk Uno"
+        assert refreshed.location == "Berlin"
+        third = repo.get_by_email("bulk-three@example.com")
+        assert third is not None
