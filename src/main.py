@@ -1,9 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Main application file for the User Service.
-
-This file initializes the Flask application, configures CORS, sets up error handlers,
-and registers the authentication blueprint.
-"""
+"""Main application file for the User Service."""
 
 import os
 from datetime import datetime, timezone
@@ -13,57 +9,43 @@ from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
 from src.auth.oauth import init_oauth
+from src.config import Config, get_config
 from src.routes.auth import auth_bp
 
 
-def create_app() -> Flask:
+def create_app(config: Config | None = None) -> Flask:
     """Create and configure the Flask application.
 
     Returns:
         Flask: The configured Flask application.
     """
+    config = config or get_config()
     app = Flask(__name__)
-    app.secret_key = os.getenv("FLASK_SECRET", "dev")
+    app.secret_key = config.flask_secret
+    app.config["APP_CONFIG"] = config
 
-    origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",")]
-    CORS(app, origins=origins)
+    CORS(app, origins=config.cors_origins)
+    if config.redis:
+        app.extensions["redis_client"] = config.redis
     init_oauth(app)
 
     @app.errorhandler(HTTPException)
     def handle_http_exception(err: HTTPException):
-        """Handle HTTP exceptions.
-
-        Args:
-            err (HTTPException): The HTTP exception.
-
-        Returns:
-            Response: A JSON response with the error description and status code.
-        """
+        """Handle HTTP exceptions by returning JSON."""
         response = jsonify({"error": err.description})
         response.status_code = err.code
         return response
 
     @app.errorhandler(Exception)
     def handle_exception(err: Exception):
-        """Handle non-HTTP exceptions.
-
-        Args:
-            err (Exception): The exception.
-
-        Returns:
-            Response: A JSON response with the error message and a 500 status code.
-        """
+        """Handle unexpected exceptions by returning JSON."""
         response = jsonify({"error": str(err)})
         response.status_code = 500
         return response
 
     @app.route("/health")
     def health():
-        """Health check endpoint.
-
-        Returns:
-            Response: A JSON response with the service status and timestamp.
-        """
+        """Health check endpoint."""
         return jsonify(
             {
                 "status": "ok",
@@ -74,14 +56,11 @@ def create_app() -> Flask:
 
     @app.route("/users")
     def users():
-        """Get a list of users (placeholder).
-
-        Returns:
-            Response: A JSON response with an empty list of users.
-        """
+        """Placeholder endpoint returning an empty list of users."""
         return jsonify({"users": []})
 
     app.register_blueprint(auth_bp)
+
     return app
 
 
@@ -91,4 +70,3 @@ app = create_app()
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5001"))
     app.run(debug=True, port=port)
-
