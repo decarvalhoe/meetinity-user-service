@@ -9,6 +9,7 @@ from marshmallow import ValidationError
 
 from src.db.session import session_scope
 from src.models.user_repository import UserRepository
+from src.routes.auth import _profile_cache_key
 from src.routes.helpers import error_response
 from src.schemas.user import UserSchema, UserUpdateSchema
 from src.services.uploads import UploadError, save_user_photo
@@ -87,7 +88,13 @@ def update_user(user_id: int):
         if user is None:
             return error_response(404, "user not found")
         updated = repo.update_user(user, data)
-        return jsonify({"user": user_schema.dump(updated)})
+        response = jsonify({"user": user_schema.dump(updated)})
+
+    redis_client = current_app.extensions.get("redis_client")
+    if redis_client:
+        redis_client.delete(_profile_cache_key(user_id))
+
+    return response
 
 
 @users_bp.delete("/<int:user_id>")
@@ -100,6 +107,11 @@ def delete_user(user_id: int):
         if user is None:
             return error_response(404, "user not found")
         repo.delete_user(user)
+
+    redis_client = current_app.extensions.get("redis_client")
+    if redis_client:
+        redis_client.delete(_profile_cache_key(user_id))
+
     return "", 204
 
 
@@ -134,7 +146,14 @@ def upload_photo(user_id: int):
         except UploadError as exc:
             return error_response(422, str(exc))
         repo.set_photo_url(user, photo_url)
-        return jsonify({"photo_url": photo_url, "user_id": user.id}), 201
+        response = jsonify({"photo_url": photo_url, "user_id": user.id})
+        response.status_code = 201
+
+    redis_client = current_app.extensions.get("redis_client")
+    if redis_client:
+        redis_client.delete(_profile_cache_key(user_id))
+
+    return response
 
 
 @users_bp.get("/search")
