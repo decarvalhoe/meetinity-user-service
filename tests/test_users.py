@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from src.db.session import session_scope
-from src.models.user_repository import UserRepository
+from src.models.repositories import RepositoryError, UserRepository
 from src.routes.auth import _profile_cache_key
 
 
@@ -295,3 +295,14 @@ def test_connection_crud(client, seeded_users):
     list_after = client.get(f"/users/{user_id}/connections")
     assert list_after.status_code == 200
     assert list_after.get_json()["total"] == 0
+
+
+def test_get_user_repository_error(monkeypatch, client):
+    def _raise(*_args, **_kwargs):
+        raise RepositoryError("database operation failed")
+
+    monkeypatch.setattr("src.routes.users.UserRepository.get", _raise)
+    response = client.get("/users/1")
+    assert response.status_code == 500
+    payload = response.get_json()
+    assert payload["error"]["message"] == "database operation failed"
